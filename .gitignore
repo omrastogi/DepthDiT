@@ -1,0 +1,6 @@
+*.png
+/checkpoints
+/data
+/results
+/wandb
+/.vscode

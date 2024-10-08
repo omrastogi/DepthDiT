@@ -152,64 +152,81 @@ def load_images(path, device):
     return image_tensors
 
 # ----------------- Inference Function -----------------
-def inference(args, rgb, model, diffusion, vae, original_size):
+def inference(args, rgb_batch, model, diffusion, vae, original_shapes):
     """
-    Runs the inference pipeline to generate a depth map and save the result.
+    Runs the inference pipeline to generate depth maps for a batch of images.
     Args:
         args (Namespace): Command-line arguments or configuration options.
-        rgb (torch.Tensor): Pre-processed RGB image tensor.
+        rgb_batch (torch.Tensor): Batch of pre-processed RGB image tensors.
         model: Pre-initialized model.
         diffusion: Pre-initialized diffusion model.
         vae: Pre-initialized VAE model.
-        output_name (str): Filename to save the output depth map.
+        original_shapes (list): List of original image shapes for resizing.
+    Returns:
+        depth_colored_images (list of PIL Images): Colorized depth maps.
+        depth_preds (list of numpy arrays): Depth predictions.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Map input image to latent space and normalize latents
+    # Map input images to latent space and normalize latents
     with torch.no_grad():
-        rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
+        rgb_input_latent = vae.encode(rgb_batch).latent_dist.sample().mul_(0.18215)
 
-    # Adjust Model for Depth Input
+    # Adjust Model for Depth Input if necessary
     if 8 != model.x_embedder.proj.weight.shape[1]:
         model = _replace_patchembed_proj(model)
 
     # Create Sampling Noise and Classifier-Free Guidance
+    batch_size = rgb_input_latent.shape[0]
     noise = torch.randn_like(rgb_input_latent, device=device)
-    n = rgb_input_latent.shape[0]
-    y = torch.zeros(n, dtype=torch.long).to(device)
+    y = torch.zeros(batch_size, dtype=torch.long).to(device)
 
+    # Prepare inputs for classifier-free guidance
     noise = torch.cat([noise, noise], 0)
-    y_null = torch.tensor([1000] * n, device=device)
+    y_null = torch.tensor([1000] * batch_size, device=device)
     y = torch.cat([y, y_null], 0)
     rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0)
     model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, input_img=rgb_input_latent)
 
     # Sample images from the diffusion model
     samples = diffusion.p_sample_loop(
-        model.forward_with_cfg, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+        model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
+        model_kwargs=model_kwargs, progress=True, device=device
     )
-    samples, _ = samples.chunk(2, dim=0)
+    samples, _ = samples.chunk(2, dim=0)  # Discard the unconditional samples
 
     # Decode the depth from latent space
-    depth = decode_depth(samples, vae)
+    with torch.no_grad():
+        depth = vae.decode(samples / 0.18215).sample[:, :1]  # Keep only the first channel
 
-    # Reshape back to the original_size
-    from torchvision.transforms.functional import InterpolationMode
-    depth = resize(depth, original_size[::-1], interpolation=InterpolationMode.BILINEAR, antialias=True)
+    # Initialize lists to store outputs
+    depth_colored_images = []
+    depth_preds = []
 
-    # Clipping the values
-    depth = torch.clip(depth, -1.0, 1.0)
+    # Post-process each depth map separately
+    for i in range(batch_size):
+        # Reshape back to the original size
+        resized_depth = torch.nn.functional.interpolate(
+            depth[i:i+1], size=original_shapes[i][::-1], mode='bilinear', align_corners=False
+        )
 
-    # Normalize and colorize the depth map
-    depth_pred = (depth + 1.0) / 2.0
-    depth_pred = depth_pred.squeeze().detach().cpu().numpy().clip(0, 1)
-    depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
-    depth_colored = (depth_colored * 255).astype(np.uint8)
-    depth_colored = np.transpose(depth_colored, (1, 2, 0))
+        # Clipping the values
+        resized_depth = torch.clamp(resized_depth, -1.0, 1.0)
 
-    # Return the colorized depth image
-    depth_colored_image = Image.fromarray(depth_colored)
-    return depth_colored_image, depth_pred
+        # Normalize and colorize the depth map
+        depth_pred = (resized_depth + 1.0) / 2.0
+        depth_pred = depth_pred.squeeze().cpu().numpy().clip(0, 1)
+
+        depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+        depth_colored = (depth_colored * 255).astype(np.uint8)
+        depth_colored = np.transpose(depth_colored, (1, 2, 0))
+        depth_colored_image = Image.fromarray(depth_colored)
+
+        # Append to the lists
+        depth_colored_images.append(depth_colored_image)
+        depth_preds.append(depth_pred)
+
+    return depth_colored_images, depth_preds
 
 # ----------------- Model Initialization Function -----------------
 def initialize_model(args):
@@ -248,27 +265,43 @@ def initialize_model(args):
 # ----------------- Main Entry Function -----------------
 def process_images(args):
     """
-    Process a single image or all images in a directory for depth inference.
+    Process images for depth inference in batches.
     Args:
         args (Namespace): Command-line arguments or configuration options.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    batch_size = args.batch_size
 
     # Initialize the model, diffusion, and VAE only once
     model, diffusion, vae = initialize_model(args)
 
-    # Load single image or all images in a directory
-    image_tensors = load_images(args.image_path, device)
+    # Load images using the provided load_images function
+    image_data_list = load_images(args.image_path, device)
 
-    # Run inference on each image
-    for image_tensor, original_shape, filename in image_tensors:
-        output_path = os.path.join(args.output_path, f"{os.path.basename(filename)}_depth.png")
-        depth_npy_output_path = os.path.join(args.output_path, f"{os.path.basename(filename)}_depth.npy")
-        depth_colored_image, depth_pred = inference(args, image_tensor, model, diffusion, vae, original_shape)
-        np.save(depth_npy_output_path, depth_pred)
-        print(f"Saved depth prediction as npy file at {depth_npy_output_path}")
-        depth_colored_image.save(output_path)
-        print(f"Saved depth-colored image at {output_path}")
+    # Helper function to create batches from the image data list
+    def batchify(data_list, batch_size):
+        for i in range(0, len(data_list), batch_size):
+            yield data_list[i:i+batch_size]
+
+    # Process images in batches
+    for batch_data in batchify(image_data_list, batch_size):
+        # Unpack the batch data
+        image_tensors, original_shapes, filenames = zip(*batch_data)
+        # Stack image tensors into a batch
+        image_batch = torch.cat(image_tensors, dim=0)  # Assuming each tensor has shape [1, C, H, W]
+        # Run inference on the batch
+        depth_colored_images, depth_preds = inference(args, image_batch, model, diffusion, vae, original_shapes)
+        # Save results for each image in the batch
+        for i in range(len(filenames)):
+            filename = filenames[i]
+            depth_colored_image = depth_colored_images[i]
+            depth_pred = depth_preds[i]
+            output_path = os.path.join(args.output_path, f"{os.path.basename(filename)}_depth.png")
+            depth_npy_output_path = os.path.join(args.output_path, f"{os.path.basename(filename)}_depth.npy")
+            np.save(depth_npy_output_path, depth_pred)
+            print(f"Saved depth prediction as npy file at {depth_npy_output_path}")
+            depth_colored_image.save(output_path)
+            print(f"Saved depth-colored image at {output_path}")
 
 
 # ----------------- Main Execution Block -----------------
@@ -285,6 +318,7 @@ if __name__ == "__main__":
     parser.add_argument("--depth-ckpt", type=bool, default=True)
     parser.add_argument("--image-path", type=str, required=True, help="Path to the input image or directory.")
     parser.add_argument("--output-path", type=str, required=True, help="Path to the output directory.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for processing images.")
     args = parser.parse_args()
     process_images(args)
 
@@ -302,14 +336,15 @@ if __name__ == "__main__":
 """
 - Also save the npy version: DONE
 - Add torchvision resize for pred: DONE
-- Multibatch inferencing: NOT STARTED
+- Multibatch inferencing: DONE
 """
 
 """
 python inference_depth.py \
   --model DiT-XL/2 \
   --image-size 512 \
+  --batch-size 9 \
   --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/000-DiT-XL-2/checkpoints/0000120.pt \
-  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/images/rgb_cam_02_fr0085.png \
+  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/images \
   --output-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results
 """

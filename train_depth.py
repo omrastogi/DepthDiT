@@ -9,6 +9,7 @@ A minimal training script for DiT using PyTorch DDP.
 """
 import torch
 from torch.nn import Conv2d
+from torch.nn.utils import clip_grad_norm_
 from torch.nn.parameter import Parameter
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -150,14 +151,13 @@ def _replace_patchembed_proj(model):
 #                                  Training Loop                                #
 #################################################################################
 
-def validation(model, loader, vae, device, step):
+def validation(model, loader, vae, device, step, rank):
     print("Validation started")
-    diffusion = create_diffusion(str(250))
+    diffusion = create_diffusion(str(25))
     
     # Get the next batch
     batch = next(iter(loader))
     rgb = batch["rgb_norm"].to(device)
-    depth_gt_for_latent = batch['depth_raw_norm'].to(device)
     rgb_int = batch["rgb_int"].to(device)  # Real RGB images from batch
 
     # mentioning params
@@ -167,28 +167,26 @@ def validation(model, loader, vae, device, step):
     # Zero the class-conditioning
     y = torch.zeros(batch_size, dtype=torch.long).to(device)
     
-    with torch.no_grad():
-        # Map input images to latent space + normalize latents:
+    with torch.no_grad(): # Map input images to latent space + normalize latents:
         rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
     
     noise = torch.randn_like(rgb_input_latent, device=device)
 
-    # # Setup classifier-free guidance:
+    # Setup classifier-free guidance:
     noise = torch.cat([noise, noise], 0)
     y_null = torch.tensor([1000] * batch_size, device=device)
     y = torch.cat([y, y_null], 0)
     rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0) # concating this as well
     model_kwargs = dict(y=y, cfg_scale=cfg_scale, input_img=rgb_input_latent)
 
-    # print(f"label:{y.shape}, noise: {noise.shape}")
-
-
     # Sample images using the diffusion model
     samples = diffusion.p_sample_loop(
         model.module.forward_with_cfg, noise.shape, noise, 
         clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
     )
+
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+    
     # Decode the depth from latent space
     depth = decode_depth(samples, vae)
     depth = torch.clip(depth, -1.0, 1.0)
@@ -221,7 +219,8 @@ def validation(model, loader, vae, device, step):
         wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {i}"))
 
     # Log to wandb
-    wandb.log({f"validation_images_step_{step}": wandb_images, "step": step})
+    if rank == 0:
+        wandb.log({f"validation_images_step_{step}": wandb_images, "step": step})
 
     # # Log as tabular in wandb
     # table = wandb.Table(columns=["Real Image", "Depth Image"])
@@ -264,16 +263,7 @@ def chw2hwc(chw):
 
 
 def decode_depth(depth_latent, vae):
-    """
-    Decode depth latent into depth map.
-
-    Args:
-        depth_latent (`torch.Tensor`):
-            Depth latent to be decoded.
-
-    Returns:
-        `torch.Tensor`: Decoded depth map.
-    """
+    """Decode depth latent into depth map"""
     # scale latent
     depth_latent = depth_latent / 0.18215
     # decode
@@ -285,9 +275,7 @@ def decode_depth(depth_latent, vae):
 
 
 def main(args):
-    """
-    Trains a new DiT model.
-    """
+    """Trains a new DiT model"""
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
@@ -317,7 +305,7 @@ def main(args):
     if rank == 0:
         wandb.init(
             project="DiT-Training",  # Replace with your WandB project name
-            name=f"DiT-{args.model}-{args.image_size}x{args.image_size}_valid_mask_loss",
+            name=f"DiT-{args.model}-{args.image_size}x{args.image_size}_full_data",
             config=vars(args),
         )
 
@@ -327,8 +315,9 @@ def main(args):
     model = DiT_models[args.model](input_size=latent_size, num_classes=args.num_classes)
 
     # Load checkpoints if available
-    ckpt_path = "/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/checkpoints/DiT-XL-2-512x512.pt"
-    state_dict = find_model(ckpt_path)
+    #TODO: Test the args.pretrained_path
+    # ckpt_path = "/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/checkpoints/DiT-XL-2-512x512.pt"
+    state_dict = find_model(args.pretrained_path)
     model.load_state_dict(state_dict)
 
     if 8 != model.x_embedder.proj.weight.shape:
@@ -341,15 +330,17 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Setup optimizer:
+    # Setup optimizer: # Keeping lr=1e-5 instead of 1e-4 (becuase training loss is giving Nan)
+    #TODO: Remove hardcoded lr 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
+    #TODO: Read config.yaml 
     # Setup dataset:
     cfg_data_split = {
         'name': 'hypersim',
         'disp_name': 'hypersim_train',
         'dir': 'Hypersim/processed/train',
-        'filenames': 'data_split/hypersim/filename_list_train_filtered_subset.txt',
+        'filenames': 'data_split/hypersim/filename_list_train.txt',
         'resize_to_hw': [512, 512],
     }
 
@@ -358,7 +349,7 @@ def main(args):
     kwargs = {'augmentation_args': {'lr_flip_p': 0.5}, 'depth_transform': depth_transform}
     kwargs['augmentation_args'] = SimpleNamespace(**kwargs['augmentation_args'])
 
-    dataset = HypersimDataset(
+    train_dataset = HypersimDataset(
         mode=DatasetMode.TRAIN,
         filename_ls_path=cfg_data_split['filenames'],
         dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", cfg_data_split['dir']),
@@ -366,12 +357,23 @@ def main(args):
         **kwargs,
     )
 
+    val_dataset = HypersimDataset(
+        mode=DatasetMode.TRAIN, # since TRAIN changes the shape
+        filename_ls_path="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data_split/hypersim/selected_vis_sample.txt",
+        dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", "Hypersim/processed/val"),
+        **cfg_data_split,
+        **kwargs,
+    )
+
+
     bsz = int(args.global_batch_size // dist.get_world_size())
 
-    sampler = DistributedSampler(dataset, num_replicas=dist.get_world_size(), rank=rank, shuffle=True, seed=args.global_seed)
-    loader = DataLoader(dataset, batch_size=bsz, sampler=sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=rank, shuffle=True, seed=args.global_seed)
+    train_loader = DataLoader(train_dataset, batch_size=bsz, sampler=sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    
+    val_loader = DataLoader(val_dataset, batch_size=3, num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
-    logger.info(f"Dataset contains {len(dataset):,} images")
+    logger.info(f"Dataset contains {len(train_dataset):,} images")
     logger.info(f"Batch size: {bsz}")
 
     # Prepare models for training:
@@ -384,18 +386,25 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     
-    validation(model, loader, vae, device, train_steps)
+    if rank == 0:
+        validation(model, val_loader, vae, device, train_steps, rank)
+    
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         
-        for batch in tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
             # Training step:
             rgb = batch["rgb_norm"].to(device)
             depth_gt_for_latent = batch['depth_raw_norm'].to(device)
-            valid_mask_for_latent = batch['valid_mask_raw'].to(device)
-            invalid_mask = ~valid_mask_for_latent
-            valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
+
+            #TODO: test this change in code
+            if args.valid_mask_loss:
+                valid_mask_for_latent = batch['valid_mask_raw'].to(device)
+                invalid_mask = ~valid_mask_for_latent
+                valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
+            else:
+                valid_mask_down = None
 
             y = torch.zeros(bsz, dtype=torch.long).to(device)
 
@@ -405,10 +414,12 @@ def main(args):
 
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y, input_img=rgb_input_latent)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs, valid_mask_down)
+            loss_dict = diffusion.training_losses(model, x, t, model_kwargs, valid_mask_down) 
             loss = loss_dict["loss"].mean()
 
             opt.zero_grad()
+
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
             loss.backward()
             opt.step()
             update_ema(ema, model.module)
@@ -419,11 +430,12 @@ def main(args):
             train_steps += 1
 
             avg_loss = running_loss / log_steps
-            wandb.log({"train_loss": avg_loss, "step": train_steps, "epoch": epoch})
+            if rank == 0:
+                wandb.log({"train_loss": avg_loss, "step": train_steps, "epoch": epoch})
 
             # Validation
             if train_steps % args.validation_every == 0 and rank == 0: 
-                validation(model, loader, vae, device, train_steps)
+                validation(model, val_loader, vae, device, train_steps, rank)
             
             # Save checkpoints:
             if train_steps % args.ckpt_every == 0 and rank == 0:
@@ -509,9 +521,16 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=500)
     parser.add_argument("--validation-every", type=int, default=200)
+    parser.add_argument("--valid-mask-loss", type=bool, default=True, help="Whether to use valid mask loss")
+    parser.add_argument("--pretrained-path", type=str, default="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/checkpoints/DiT-XL-2-512x512.pt", help="Path to the pretrained model checkpoint")
     args = parser.parse_args()
     main(args)
 
 '''
-torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 800 --validation-every 200 --global-batch-size 4 --ckpt-every 1600 --image-size 512 --data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
+torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 20 --validation-every 5 --global-batch-size 4 --ckpt-every 20 --image-size 512 --data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
+'''
+
+# For two gpus
+'''
+torchrun --nnodes=1 --nproc_per_node=2 train_depth.py --model DiT-XL/2 --epochs 3 --validation-every 2000 --global-batch-size 20 --ckpt-every 4000 --image-size 512 --data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
 '''

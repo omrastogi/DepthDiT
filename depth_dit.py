@@ -76,19 +76,23 @@ def validation(args):
     # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
+    
     if args.depth_ckpt == True:
         model = _replace_patchembed_proj(model)
     model.load_state_dict(state_dict, strict=False)
     model.eval()  # important!
+    
     diffusion = create_diffusion(str(args.num_sampling_steps))
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    
     if 8 != model.x_embedder.proj.weight.shape[1]:
         model = _replace_patchembed_proj(model) 
-        # model.in_channels = 8
-        # Setup dataset params
+    
+    # Setup dataset params
     cfg_normalizer = SimpleNamespace(
         type='scale_shift_depth', clip=True, norm_min=-1.0, norm_max=1.0, min_max_quantile=0.02
     )
+
     depth_transform = get_depth_normalizer(cfg_normalizer=cfg_normalizer)
     kwargs = {'augmentation_args': {'lr_flip_p': 0.5}, 'depth_transform': depth_transform}
     kwargs['augmentation_args'] = SimpleNamespace(**kwargs['augmentation_args'])
@@ -103,56 +107,74 @@ def validation(args):
 
     # Calling dataset 
     dataset = HypersimDataset(
-            mode=DatasetMode.TRAIN,
-            filename_ls_path="data_split/hypersim/filename_list_train_filtered_subset.txt",
-            dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", "Hypersim/processed/train"),
-            **cfg_data_split,
-            **kwargs,
-        )
-        
-    batch_sz = 2
+        mode=DatasetMode.TRAIN,
+        filename_ls_path="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data_split/hypersim/selected_vis_sample.txt",
+        dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", "Hypersim/processed/val"),
+        **cfg_data_split,
+        **kwargs,
+    )
+    
+    batch_size = 1
     cfg_scale = 4.0
     loader = DataLoader(
         dataset,
-        batch_size=batch_sz,
+        batch_size=batch_size,
         shuffle=True,
         pin_memory=True,
         drop_last=True
     )
-    # Extract the first batch from the loader
-    first_batch = next(iter(loader))
-    rgb = first_batch["rgb_norm"].to(device)
-    y = torch.zeros(batch_sz, dtype=torch.long).to(device)
 
-    with torch.no_grad():
+    # Get the next batch
+    batch = next(iter(loader))
+    print(batch.keys())
+    rgb = batch["rgb_norm"].to(device)
+    rgb_int = batch["rgb_int"].to(device)  # Real RGB images from batch
+
+    # Zero the class-conditioning
+    y = torch.zeros(batch_size, dtype=torch.long).to(device)
+
+    print(rgb.shape)
+    with torch.no_grad(): # Map input images to latent space + normalize latents:
         rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
 
-    model_kwargs = dict(y=y, cfg_scale=cfg_scale, input_img=rgb_input_latent)
     noise = torch.randn_like(rgb_input_latent, device=device)
-    
+
     # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * batch_sz, device=device)
+    noise = torch.cat([noise, noise], 0)
+    y_null = torch.tensor([1000] * batch_size, device=device)
     y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=cfg_scale)
+    rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0) # concatenating this as well
+    model_kwargs = dict(y=y, cfg_scale=cfg_scale, input_img=rgb_input_latent)
 
     # Sample images:
     samples = diffusion.p_sample_loop(
         model.forward_with_cfg, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
     )
 
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+    # Remove null class samples
+    samples, _ = samples.chunk(2, dim=0)  
+    
+    # Decode the depth from latent space
     depth = decode_depth(samples, vae)
     depth = torch.clip(depth, -1.0, 1.0)
-    depth_pred = (depth + 1.0)/2.0 
+    
+    # Normalize depth values between 0 and 1
+    depth_pred = (depth + 1.0) / 2.0
     depth_pred = depth_pred.squeeze()
-    depth_pred = depth_pred.detach().cpu().numpy()  # Ensure tensor is detached before converting to numpy
+    
+    # Convert depth prediction to numpy array
+    depth_pred = depth_pred.detach().cpu().numpy()
     depth_pred = depth_pred.clip(0, 1)
-    depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()  # [3, H, W], value in (0, 1)
+    
+    # Colorize depth maps using a colormap
+    depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+    
+    # Convert to uint8 for wandb logging
     depth_colored = (depth_colored * 255).astype(np.uint8)
-    depth_colored_hwc = chw2hwc(depth_colored)
-    depth_colored_img = Image.fromarray(depth_colored_hwc)
-    depth_colored_img.save("depth_image.png")
+    print(depth_colored.shape)
+    depth_colored = np.transpose(depth_colored, (1, 2, 0))
+
+    Image.fromarray(depth_colored).save("depth_image.png")
 
 
 def chw2hwc(chw):
@@ -224,7 +246,22 @@ def decode_depth(depth_latent, vae):
     depth_mean = stacked.mean(dim=1, keepdim=True)
     return depth_mean
 
-def main(args):
+def get_rgb_norm(image_path):
+    # Load the image using PIL
+    image = Image.open(image_path)
+    # Resize the image to 512x512
+    image = image.resize((512, 512))
+    # Convert the image to a numpy array and ensure it's in RGB format
+    rgb = np.asarray(image.convert("RGB"))
+    # Transpose the image to get it in [C, H, W] format, as expected by the code
+    rgb = np.transpose(rgb, (2, 0, 1)).astype(int)  # [rgb, H, W]
+    # Normalize the RGB values to the range [-1, 1]
+    rgb_norm = rgb / 255.0 * 2.0 - 1.0  # [0, 255] -> [-1, 1]
+    # Convert the numpy array to a torch tensor and add a batch dimension
+    rgb_norm = torch.from_numpy(rgb_norm).float().unsqueeze(0)  # [1, C, H, W]
+    return rgb_norm
+
+def inference(args):
     # Setup PyTorch:
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
@@ -251,34 +288,58 @@ def main(args):
     diffusion = create_diffusion(str(args.num_sampling_steps))
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
-    # Labels to condition the model with (feel free to change):
-    class_labels = [0]
+    rgb = get_rgb_norm("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data/Hypersim/processed/val/ai_015_004/rgb_cam_00_fr0002.png").to(device)
+    with torch.no_grad(): # Map input images to latent space + normalize latents:
+        rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
+
+    n = rgb_input_latent.shape[0]
 
     if 8 != model.x_embedder.proj.weight.shape[1]:
         model = _replace_patchembed_proj(model) 
         # model.in_channels = 8
 
     # Create sampling noise:
-    n = len(class_labels)
-    z = torch.randn(n, 4, latent_size, latent_size, device=device)
-    y = torch.tensor(class_labels, device=device)
+    n = rgb_input_latent.shape[0]
+    noise = torch.randn_like(rgb_input_latent, device=device)
+    y = torch.zeros(n, dtype=torch.long).to(device)
 
     # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
+    noise = torch.cat([noise, noise], 0)
     y_null = torch.tensor([1000] * n, device=device)
     y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, input_img=z)
+    rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0) # concating this as well
+    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, input_img=rgb_input_latent)
 
 
     # Sample images:
     samples = diffusion.p_sample_loop(
-        model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
+        model.forward_with_cfg, noise.shape, noise, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
     )
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
+    
+    # Decode the depth from latent space
+    depth = decode_depth(samples, vae)
+    depth = torch.clip(depth, -1.0, 1.0)
+    
+    # Normalize depth values between 0 and 1
+    depth_pred = (depth + 1.0) / 2.0
+    depth_pred = depth_pred.squeeze()
+    
+    # Convert depth prediction to numpy array
+    depth_pred = depth_pred.detach().cpu().numpy()
+    depth_pred = depth_pred.clip(0, 1)
+    
+    # Colorize depth maps using a colormap
+    depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+    
+    # Convert to uint8 for wandb logging
+    depth_colored = (depth_colored * 255).astype(np.uint8)
+    depth_colored = np.transpose(depth_colored, (1, 2, 0))
 
-    # Save and display images:
-    save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
+
+    # Save and display images as numpy array:
+    depth_colored_image = Image.fromarray(depth_colored)
+    depth_colored_image.save("sample.png")
 
 
 if __name__ == "__main__":
@@ -288,14 +349,15 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
-    parser.add_argument("--num-sampling-steps", type=int, default=250)
+    parser.add_argument("--num-sampling-steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     parser.add_argument("--depth-ckpt", type=bool, default=True, help="Boolean flag to indicate if depth checkpoint should be used.")
     args = parser.parse_args()
-    validation(args)
+    # validation(args)
+    inference(args)
 
 """
-python depth_dit.py --model DiT-XL/2 --image-size 512 --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/002-DiT-XL-2/checkpoints/0000150.pt
+python depth_dit.py --model DiT-XL/2 --image-size 512 --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/007-DiT-XL-2/checkpoints/0005000.pt
 """

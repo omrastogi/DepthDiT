@@ -171,10 +171,9 @@ def inference(args, rgb_batch, model, diffusion, vae, original_shapes):
     # Map input images to latent space and normalize latents
     with torch.no_grad():
         rgb_input_latent = vae.encode(rgb_batch).latent_dist.sample().mul_(0.18215)
-
-    # Adjust Model for Depth Input if necessary
-    if 8 != model.x_embedder.proj.weight.shape[1]:
-        model = _replace_patchembed_proj(model)
+    # # Adjust Model for Depth Input if necessary
+    # if 8 != model.x_embedder.proj.weight.shape[1]:
+    #     model = _replace_patchembed_proj(model)
 
     # Create Sampling Noise and Classifier-Free Guidance
     batch_size = rgb_input_latent.shape[0]
@@ -197,7 +196,7 @@ def inference(args, rgb_batch, model, diffusion, vae, original_shapes):
 
     # Decode the depth from latent space
     with torch.no_grad():
-        depth = vae.decode(samples / 0.18215).sample[:, :1]  # Keep only the first channel
+        depth = decode_depth(samples, vae)  # Keep only the first channel
 
     # Initialize lists to store outputs
     depth_colored_images = []
@@ -247,12 +246,16 @@ def initialize_model(args):
     ).to(device)
 
     # Load checkpoint
-    ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
-    state_dict = find_model(ckpt_path)
-    
-    if args.depth_ckpt:
+    ckpt_path = args.ckpt
+    checkpoint = torch.load(args.ckpt, map_location=lambda storage, loc: storage)
+    if "model" in checkpoint:  # supports checkpoints from train.py
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    # Modify the model architecture before loading state dict
+    if 8 != model.x_embedder.proj.weight.shape[1]:
         model = _replace_patchembed_proj(model)
-    
+
     model.load_state_dict(state_dict, strict=False)
     model.eval()
 
@@ -282,7 +285,9 @@ def process_images(args):
     def batchify(data_list, batch_size):
         for i in range(0, len(data_list), batch_size):
             yield data_list[i:i+batch_size]
-
+    # Check if the output path doesn't exist and create the directory if needed
+    if not os.path.exists(args.output_path):
+        os.makedirs(args.output_path)
     # Process images in batches
     for batch_data in batchify(image_data_list, batch_size):
         # Unpack the batch data
@@ -298,27 +303,28 @@ def process_images(args):
             depth_pred = depth_preds[i]
             output_path = os.path.join(args.output_path, f"{os.path.basename(filename)}_depth.png")
             depth_npy_output_path = os.path.join(args.output_path, f"{os.path.basename(filename)}_depth.npy")
-            np.save(depth_npy_output_path, depth_pred)
-            print(f"Saved depth prediction as npy file at {depth_npy_output_path}")
             depth_colored_image.save(output_path)
             print(f"Saved depth-colored image at {output_path}")
+            if args.save_npy:
+                np.save(depth_npy_output_path, depth_pred)
+                print(f"Saved depth prediction as npy file at {depth_npy_output_path}")
 
 
 # ----------------- Main Execution Block -----------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
-    parser.add_argument("--num-sampling-steps", type=int, default=20)
+    parser.add_argument("--num-sampling-steps", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None)
-    parser.add_argument("--depth-ckpt", type=bool, default=True)
     parser.add_argument("--image-path", type=str, required=True, help="Path to the input image or directory.")
     parser.add_argument("--output-path", type=str, required=True, help="Path to the output directory.")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size for processing images.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for processing images.")
+    parser.add_argument("--save-npy", action="store_true", help="Save depth as npy")
     args = parser.parse_args()
     process_images(args)
 
@@ -344,7 +350,8 @@ python inference_depth.py \
   --model DiT-XL/2 \
   --image-size 512 \
   --batch-size 9 \
-  --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/000-DiT-XL-2/checkpoints/0000120.pt \
-  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/images \
-  --output-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results
-"""
+  --num-sampling-steps 25 \
+  --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/1-epoch-not-valid-mask/checkpoints/0002400.pt \
+  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/hypersim_vis/rgb_cam_00_fr0002.png \
+  --output-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/1-epoch-not-valid-mask/inference/0002400 
+  """

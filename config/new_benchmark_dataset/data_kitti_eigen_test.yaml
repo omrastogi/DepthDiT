@@ -1,0 +1,6 @@
+name: kitti
+disp_name: kitti_eigen_test_full
+dir: kitti/kitti_eigen_split_test.tar
+filenames: data_split/kitti/one_filename_list.txt
+kitti_bm_crop: true
+valid_mask_crop: eigen

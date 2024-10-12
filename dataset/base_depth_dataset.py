@@ -19,7 +19,6 @@
 # If you use or adapt this code, please attribute to https://github.com/prs-eth/marigold.
 # More information about the method can be found at https://marigoldmonodepth.github.io
 # --------------------------------------------------------------------------
-
 import io
 import os
 import random
@@ -114,13 +113,24 @@ class BaseDepthDataset(Dataset):
         return len(self.filenames)
 
     def __getitem__(self, index):
-        rasters, other = self._get_data_item(index)
-        if DatasetMode.TRAIN == self.mode:
-            rasters = self._training_preprocess(rasters)
-        # merge
-        outputs = rasters
-        outputs.update(other)
-        return outputs
+        try:
+            rasters, other = self._get_data_item(index)
+            if DatasetMode.TRAIN == self.mode:
+                rasters = self._training_preprocess(rasters)
+            # merge
+            outputs = rasters
+            outputs.update(other)
+            return outputs
+        except Exception as e:
+            rgb_rel_path = self.filenames[index][0]
+            error_message = (
+                f"Error occurred while processing index {index}:\n"
+                f"RGB file: {rgb_rel_path}\n"
+                f"Error: {str(e)}"
+            )
+            print(error_message)
+            return self.__getitem__(random.randint(0, len(self.filenames) - 1))
+            
 
     def _get_data_item(self, index):
         rgb_rel_path, depth_rel_path, filled_rel_path = self._get_data_path(index=index)

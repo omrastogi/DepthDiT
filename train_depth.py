@@ -274,6 +274,68 @@ def decode_depth(depth_latent, vae):
     return depth_mean
 
 
+def create_and_initialize_model(args, device, rank, logger):
+    """
+    Create and initialize the model, EMA model, and other components.
+    Args:
+        args: Arguments containing model parameters and paths.
+        device: The device (CPU or GPU) to load the model on.
+        rank: The rank for DistributedDataParallel (DDP).
+        logger: Logger for logging information.
+    Returns:
+        Tuple containing the model, EMA model, diffusion, VAE, and optimizer (if available).
+    """
+    # Create model:
+    assert args.image_size % 8 == 0, "Image size must be divisible by 8."
+    latent_size = args.image_size // 8
+    model = DiT_models[args.model](input_size=latent_size, num_classes=args.num_classes)
+
+    # Load the checkpoint
+    checkpoint = torch.load(args.pretrained_path, map_location=lambda storage, loc: storage)
+
+    if "model" in checkpoint:  # Check if it's a checkpoint saved during training
+        state_dict_model = checkpoint["model"]
+    else:
+        state_dict_model = checkpoint
+
+    # Check if the checkpoint is for a Depth-DiT model
+    if "is_depth" in checkpoint:
+        # The state_dict is already modified for depth, so modify the model first
+        model = _replace_patchembed_proj(model)
+        # Load the state_dict into the model
+        model.load_state_dict(state_dict_model)
+    else:
+        # For a vanilla DiT model:
+        # Load the state_dict first, and then modify the model afterwards
+        model.load_state_dict(state_dict_model)
+        model = _replace_patchembed_proj(model)
+    
+    # Create EMA model and set it as non-trainable
+    ema = deepcopy(model).to(device)  # EMA model
+    requires_grad(ema, False)
+
+    # If the checkpoint has the EMA state, load it
+    if "ema" in checkpoint:
+        ema.load_state_dict(checkpoint["ema"])
+        logger.info("EMA state loaded from checkpoint.")
+
+    # Initialize the optimizer only if the optimizer state is present in the checkpoint
+    optimizer_dict = None
+    if "opt" in checkpoint:
+        optimizer_dict = checkpoint["opt"]
+        # Define the optimizer (make sure to match this with your training setup)
+        # optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        # optimizer.load_state_dict(checkpoint["opt"])
+        # logger.info("Optimizer state loaded from checkpoint.")
+    
+    diffusion = create_diffusion(timestep_respacing="")
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+
+    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    return model, ema, diffusion, vae, optimizer_dict
+
+
 def main(args):
     """Trains a new DiT model"""
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
@@ -305,42 +367,25 @@ def main(args):
     if rank == 0:
         wandb.init(
             project="DiT-Training",  # Replace with your WandB project name
-            name=f"DiT-{args.model}-{args.image_size}x{args.image_size}_full_data",
+            name=f"DiT-{args.model}-{args.image_size}x{args.image_size}_code_testing",
             config=vars(args),
         )
 
-    # Create model:
-    assert args.image_size % 8 == 0, "Image size must be divisible by 8."
-    latent_size = args.image_size // 8
-    model = DiT_models[args.model](input_size=latent_size, num_classes=args.num_classes)
-
-    # Load checkpoints if available
-    #TODO: Test the args.pretrained_path
-    # ckpt_path = "/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/checkpoints/DiT-XL-2-512x512.pt"
-    state_dict = find_model(args.pretrained_path)
-    model.load_state_dict(state_dict)
-
-    if 8 != model.x_embedder.proj.weight.shape:
-        model = _replace_patchembed_proj(model)
-
-    ema = deepcopy(model).to(device)  # EMA model
-    requires_grad(ema, False)
+    model, ema, diffusion, vae, optimizer_dict = create_and_initialize_model(args, device, rank, logger)
     model = DDP(model.to(device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="")
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Setup optimizer: # Keeping lr=1e-5 instead of 1e-4 (becuase training loss is giving Nan)
-    #TODO: Remove hardcoded lr 
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if optimizer_dict is not None:
+        opt.load_state_dict(optimizer_dict)
 
+    
     #TODO: Read config.yaml 
     # Setup dataset:
     cfg_data_split = {
         'name': 'hypersim',
         'disp_name': 'hypersim_train',
         'dir': 'Hypersim/processed/train',
-        'filenames': 'data_split/hypersim/filename_list_train.txt',
+        'filenames': 'data_split/hypersim/filename_list_train_filtered.txt',
         'resize_to_hw': [512, 512],
     }
 
@@ -386,8 +431,8 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     
-    if rank == 0:
-        validation(model, val_loader, vae, device, train_steps, rank)
+    # if rank == 0:
+    #     validation(model, val_loader, vae, device, train_steps, rank)
     
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
@@ -398,7 +443,6 @@ def main(args):
             rgb = batch["rgb_norm"].to(device)
             depth_gt_for_latent = batch['depth_raw_norm'].to(device)
 
-            #TODO: test this change in code
             if args.valid_mask_loss:
                 valid_mask_for_latent = batch['valid_mask_raw'].to(device)
                 invalid_mask = ~valid_mask_for_latent
@@ -438,11 +482,18 @@ def main(args):
                 validation(model, val_loader, vae, device, train_steps, rank)
             
             # Save checkpoints:
-            if train_steps % args.ckpt_every == 0 and rank == 0:
-                checkpoint = {"model": model.module.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(), "args": args}
-                checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                torch.save(checkpoint, checkpoint_path)
-                logger.info(f"Saved checkpoint to {checkpoint_path}")
+            if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                if rank == 0:
+                    checkpoint = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "args": args,
+                        "is_depth": True
+                    }
+                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
 
     logger.info("Training complete!")
@@ -521,8 +572,10 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=500)
     parser.add_argument("--validation-every", type=int, default=200)
-    parser.add_argument("--valid-mask-loss", type=bool, default=True, help="Whether to use valid mask loss")
+    parser.add_argument("--valid-mask-loss", action="store_true", help="Use valid mask loss")
     parser.add_argument("--pretrained-path", type=str, default="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/checkpoints/DiT-XL-2-512x512.pt", help="Path to the pretrained model checkpoint")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the optimizer")
+    parser.add_argument("--weight-decay", type=float, default=0, help="Weight decay for the optimizer")
     args = parser.parse_args()
     main(args)
 
@@ -532,5 +585,58 @@ torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 
 
 # For two gpus
 '''
-torchrun --nnodes=1 --nproc_per_node=2 train_depth.py --model DiT-XL/2 --epochs 3 --validation-every 2000 --global-batch-size 20 --ckpt-every 4000 --image-size 512 --data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
+torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
+--model DiT-XL/2 \
+--valid-mask-loss \
+--epochs 6 \
+--validation-every 1000 \
+--global-batch-size 20 \
+--ckpt-every 2000 \
+--image-size 512 \
+--pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/003-DiT-XL-2/checkpoints/0012000.pt \
+--data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
 '''
+
+
+'''
+torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
+--model DiT-XL/2 \
+--valid-mask-loss \
+--epochs 1 \
+--validation-every 1 \
+--global-batch-size 4 \
+--ckpt-every 5 \
+--image-size 512 \
+--pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/003-DiT-XL-2/checkpoints/0012000.pt \
+--data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
+'''
+
+
+
+# TESTING
+"""
+Depth-DiT and Vanilla-DiT checkpoints 
+- Run with Vanilla-DiT model - Done
+- Run with Depth-DiT model - Done - wandb log is very close to the validation outputs at that step  
+"""
+
+# TODO
+
+"""
+Add support to open both Depth-DiT and Vanilla-DiT checkpoints - DONE 
+"""
+
+"""
+Add Multi-resolution noise 
+- First document all that is happening in Marigold's training 
+- Then create the multi-res noise here
+"""
+"""
+LOWER PRIORITY 
+Make sure that the ema is being updated properly. 
+- See if its required or just redundant 
+- If required, 
+- - make sure it updated
+- - use it for val 
+- - use it for inference 
+"""

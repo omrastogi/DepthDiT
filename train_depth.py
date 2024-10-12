@@ -7,44 +7,40 @@
 """
 A minimal training script for DiT using PyTorch DDP.
 """
-import torch
-from torch.nn import Conv2d
-from torch.nn.utils import clip_grad_norm_
-from torch.nn.parameter import Parameter
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
-from torchvision import transforms
-from torchvision.utils import save_image
-import numpy as np
-from collections import OrderedDict
-from PIL import Image
-from copy import deepcopy
-from glob import glob
-from time import time
 import argparse
+import gc
 import logging
 import os
-import gc
+from collections import OrderedDict
+from copy import deepcopy
+from datetime import datetime
+from glob import glob
 
-import numpy as np 
 import matplotlib
-from models import DiT_models
-from diffusion import create_diffusion
+import numpy as np
+import torch
+import torch.distributed as dist
+from PIL import Image
 from diffusers.models import AutoencoderKL
-from download import find_model
+from omegaconf import OmegaConf
+from torch.nn import Conv2d
+from torch.nn.parameter import Parameter
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 import wandb
 
-from dataset.base_depth_dataset import BaseDepthDataset, get_pred_name, DatasetMode  # noqa: F401
-from dataset.hypersim_dataset import HypersimDataset
-from dataset.depth_transform import get_depth_normalizer
-from types import SimpleNamespace
+from src.diffusion import create_diffusion
+from src.dataset.base_depth_dataset import BaseDepthDataset, get_pred_name, DatasetMode  # noqa: F401
+from src.dataset.depth_transform import get_depth_normalizer
+from src.dataset.hypersim_dataset import HypersimDataset
+from src.models.models import DiT_models
+
+# the first flag below was False when we tested this script but True makes A100 training a lot faster:
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 #################################################################################
@@ -273,6 +269,11 @@ def decode_depth(depth_latent, vae):
     depth_mean = stacked.mean(dim=1, keepdim=True)
     return depth_mean
 
+def load_config(config_path):
+    # Load configuration using OmegaConf
+    config = OmegaConf.load(config_path)
+    return config
+
 
 def create_and_initialize_model(args, device, rank, logger):
     """
@@ -335,6 +336,51 @@ def create_and_initialize_model(args, device, rank, logger):
     
     return model, ema, diffusion, vae, optimizer_dict
 
+def create_datasets(config):
+    # Load dataset configuration
+    cfg_data_split = config.dataset.hypersim
+
+    # Load paths
+    base_data_dir = config.paths.base_data_dir
+    val_data_dir = config.paths.val_data_dir
+
+    # Create depth transform directly from the config
+    depth_transform = get_depth_normalizer(config.depth_transform)
+
+    # Augmentation arguments
+    augmentation_args = config.augmentation_args
+    kwargs = {
+        'augmentation_args': augmentation_args,
+        'depth_transform': depth_transform
+    }
+
+    # Print all the arguments
+    print("cfg_data_split:", cfg_data_split)
+    print("base_data_dir:", base_data_dir)
+    print("val_data_dir:", val_data_dir)
+    print("depth_transform:", depth_transform)
+    print("augmentation_args:", augmentation_args)
+    print("kwargs:", kwargs)
+
+    # Train dataset
+    train_dataset = HypersimDataset(
+        mode=DatasetMode.TRAIN,
+        filename_ls_path=cfg_data_split.filenames,
+        dataset_dir=os.path.join(base_data_dir, cfg_data_split.dir),
+        **cfg_data_split,
+        **kwargs,
+    )
+
+    # Validation dataset
+    val_dataset = HypersimDataset(
+        mode=DatasetMode.TRAIN,  # since TRAIN changes the shape
+        filename_ls_path=os.path.join(val_data_dir, cfg_data_split.val_filenames),
+        dataset_dir=os.path.join(base_data_dir, cfg_data_split.val_dir),
+        **cfg_data_split,
+        **kwargs,
+    )
+    # return None, None
+    return train_dataset, val_dataset
 
 def main(args):
     """Trains a new DiT model"""
@@ -355,7 +401,7 @@ def main(args):
         os.makedirs(args.results_dir, exist_ok=True)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"
+        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{args.training_label}--{datetime.now().strftime("%m%d-%H:%M:%S")}"
         checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
@@ -367,7 +413,7 @@ def main(args):
     if rank == 0:
         wandb.init(
             project="DiT-Training",  # Replace with your WandB project name
-            name=f"DiT-{args.model}-{args.image_size}x{args.image_size}_code_testing",
+            name=f"{args.model}-{args.image_size}-{args.training_label}-{datetime.now().strftime("%m%d-%H:%M:%S")}",
             config=vars(args),
         )
 
@@ -380,36 +426,38 @@ def main(args):
 
     
     #TODO: Read config.yaml 
-    # Setup dataset:
-    cfg_data_split = {
-        'name': 'hypersim',
-        'disp_name': 'hypersim_train',
-        'dir': 'Hypersim/processed/train',
-        'filenames': 'data_split/hypersim/filename_list_train_filtered.txt',
-        'resize_to_hw': [512, 512],
-    }
+    # # Setup dataset:
+    # cfg_data_split = {
+    #     'name': 'hypersim',
+    #     'disp_name': 'hypersim_train',
+    #     'dir': 'Hypersim/processed/train',
+    #     'filenames': 'data_split/hypersim/filename_list_train_filtered.txt',
+    #     'resize_to_hw': [512, 512],
+    # }
 
-    depth_transform = get_depth_normalizer(SimpleNamespace(
-        type='scale_shift_depth', clip=True, norm_min=-1.0, norm_max=1.0, min_max_quantile=0.02))
-    kwargs = {'augmentation_args': {'lr_flip_p': 0.5}, 'depth_transform': depth_transform}
-    kwargs['augmentation_args'] = SimpleNamespace(**kwargs['augmentation_args'])
+    # depth_transform = get_depth_normalizer(SimpleNamespace(
+    #     type='scale_shift_depth', clip=True, norm_min=-1.0, norm_max=1.0, min_max_quantile=0.02))
+    # kwargs = {'augmentation_args': {'lr_flip_p': 0.5}, 'depth_transform': depth_transform}
+    # kwargs['augmentation_args'] = SimpleNamespace(**kwargs['augmentation_args'])
 
-    train_dataset = HypersimDataset(
-        mode=DatasetMode.TRAIN,
-        filename_ls_path=cfg_data_split['filenames'],
-        dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", cfg_data_split['dir']),
-        **cfg_data_split,
-        **kwargs,
-    )
+    # train_dataset = HypersimDataset(
+    #     mode=DatasetMode.TRAIN,
+    #     filename_ls_path=cfg_data_split['filenames'],
+    #     dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", cfg_data_split['dir']),
+    #     **cfg_data_split,
+    #     **kwargs,
+    # )
 
-    val_dataset = HypersimDataset(
-        mode=DatasetMode.TRAIN, # since TRAIN changes the shape
-        filename_ls_path="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data_split/hypersim/selected_vis_sample.txt",
-        dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", "Hypersim/processed/val"),
-        **cfg_data_split,
-        **kwargs,
-    )
+    # val_dataset = HypersimDataset(
+    #     mode=DatasetMode.TRAIN, # since TRAIN changes the shape
+    #     filename_ls_path="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data_split/hypersim/selected_vis_sample.txt",
+    #     dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", "Hypersim/processed/val"),
+    #     **cfg_data_split,
+    #     **kwargs,
+    # )
 
+    config = load_config('config/config.yaml')
+    train_dataset, val_dataset = create_datasets(config)
 
     bsz = int(args.global_batch_size // dist.get_world_size())
 
@@ -507,7 +555,6 @@ def encode_depth(depth_in, vae):
     depth_latent = vae.encode(stacked).latent_dist.sample().mul_(0.18215)
     return depth_latent
 
-@staticmethod
 def stack_depth_images(depth_in):
     if 4 == len(depth_in.shape):
         stacked = depth_in.repeat(1, 3, 1, 1)
@@ -576,6 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained-path", type=str, default="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/checkpoints/DiT-XL-2-512x512.pt", help="Path to the pretrained model checkpoint")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the optimizer")
     parser.add_argument("--weight-decay", type=float, default=0, help="Weight decay for the optimizer")
+    parser.add_argument("--training-label", type=str, default="training", help="Label for the training session")
     args = parser.parse_args()
     main(args)
 
@@ -599,7 +647,7 @@ torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 
 
 '''
-torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
+torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
 --epochs 1 \
@@ -607,7 +655,7 @@ torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
 --global-batch-size 4 \
 --ckpt-every 5 \
 --image-size 512 \
---pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/003-DiT-XL-2/checkpoints/0012000.pt \
+--pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/6-epochs/checkpoints/0014000.pt \
 --data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
 '''
 
@@ -624,6 +672,9 @@ Depth-DiT and Vanilla-DiT checkpoints
 
 """
 Add support to open both Depth-DiT and Vanilla-DiT checkpoints - DONE 
+"""
+"""
+Test the wandb label
 """
 
 """

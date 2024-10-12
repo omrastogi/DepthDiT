@@ -1,33 +1,30 @@
-import torch
-from torch.nn import Conv2d
-from torch.nn.parameter import Parameter
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-from torchvision.utils import save_image
-from torchvision.transforms.functional import resize
-from torch.utils.data import DataLoader
-from diffusion import create_diffusion
-from diffusers.models import AutoencoderKL
-from download import find_model
-from models import DiT_models
 import argparse
-
-from dataset.base_depth_dataset import BaseDepthDataset, get_pred_name, DatasetMode  # noqa: F401
-from dataset import get_dataset
-from dataset.hypersim_dataset import HypersimDataset
-from dataset.depth_transform import get_depth_normalizer
-from types import SimpleNamespace
+import logging  # Added for logging
 import os
-import numpy as np
+
 import matplotlib
+import numpy as np
+import torch
 from PIL import Image
 from omegaconf import OmegaConf
-
+from torch.nn import Conv2d
+from torch.nn.parameter import Parameter
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision.transforms.functional import pil_to_tensor
-from ensemble import ensemble_depth
-import logging  # Added for logging
+from torchvision.transforms.functional import pil_to_tensor, resize
+from torchvision.utils import save_image
+from diffusers.models import AutoencoderKL
 from tqdm import tqdm
+
+from src.dataset import get_dataset
+from src.dataset.base_depth_dataset import BaseDepthDataset, get_pred_name, DatasetMode  # noqa: F401
+from src.dataset.depth_transform import get_depth_normalizer
+from src.dataset.hypersim_dataset import HypersimDataset
+from src.diffusion import create_diffusion
+from src.util.ensemble import ensemble_depth
+from src.models.models import DiT_models
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 # Set up logging

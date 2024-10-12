@@ -1,25 +1,26 @@
+import argparse
+import os
+
+import matplotlib
+import numpy as np
 import torch
+from PIL import Image
 from torch.nn import Conv2d
 from torch.nn.parameter import Parameter
+from torch.utils.data import DataLoader
+from torchvision.transforms.functional import resize
+from torchvision.utils import save_image
+from diffusers.models import AutoencoderKL
+
+from src.dataset.base_depth_dataset import BaseDepthDataset, get_pred_name, DatasetMode  # noqa: F401
+from src.dataset.depth_transform import get_depth_normalizer
+from src.dataset.hypersim_dataset import HypersimDataset
+from src.diffusion import create_diffusion
+from src.models.download import find_model
+from src.models.models import DiT_models
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-from torchvision.utils import save_image
-from torchvision.transforms.functional import resize
-from torch.utils.data import DataLoader
-from diffusion import create_diffusion
-from diffusers.models import AutoencoderKL
-from download import find_model
-from models import DiT_models
-import argparse
-
-from dataset.base_depth_dataset import BaseDepthDataset, get_pred_name, DatasetMode  # noqa: F401
-from dataset.hypersim_dataset import HypersimDataset
-from dataset.depth_transform import get_depth_normalizer
-from types import SimpleNamespace
-import os
-import numpy as np
-import matplotlib
-from PIL import Image
 
 def _replace_patchembed_proj(model):
     # https://github.com/prs-eth/Marigold/blob/518ab83a328ecbf57e7d63ec370e15dfa4336598/src/trainer/marigold_trainer.py#L169
@@ -110,12 +111,6 @@ def get_rgb_norm(image_path):
 
 
 
-
-import os
-from PIL import Image
-import torch
-import numpy as np
-
 # ----------------- Load Image(s) Function -----------------
 def load_images(path, device):
     """
@@ -171,9 +166,6 @@ def inference(args, rgb_batch, model, diffusion, vae, original_shapes):
     # Map input images to latent space and normalize latents
     with torch.no_grad():
         rgb_input_latent = vae.encode(rgb_batch).latent_dist.sample().mul_(0.18215)
-    # # Adjust Model for Depth Input if necessary
-    # if 8 != model.x_embedder.proj.weight.shape[1]:
-    #     model = _replace_patchembed_proj(model)
 
     # Create Sampling Noise and Classifier-Free Guidance
     batch_size = rgb_input_latent.shape[0]
@@ -245,6 +237,10 @@ def initialize_model(args):
         num_classes=args.num_classes,
     ).to(device)
 
+    # Modify the model architecture before loading state dict
+    if 8 != model.x_embedder.proj.weight.shape[1]:
+        model = _replace_patchembed_proj(model)
+
     # Load checkpoint
     ckpt_path = args.ckpt
     checkpoint = torch.load(args.ckpt, map_location=lambda storage, loc: storage)
@@ -252,9 +248,6 @@ def initialize_model(args):
         state_dict = checkpoint["model"]
     else:
         state_dict = checkpoint
-    # Modify the model architecture before loading state dict
-    if 8 != model.x_embedder.proj.weight.shape[1]:
-        model = _replace_patchembed_proj(model)
 
     model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -349,9 +342,9 @@ if __name__ == "__main__":
 python inference_depth.py \
   --model DiT-XL/2 \
   --image-size 512 \
-  --batch-size 9 \
-  --num-sampling-steps 25 \
+  --batch-size 10 \
+  --num-sampling-steps 250 \
   --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/1-epoch-not-valid-mask/checkpoints/0002400.pt \
-  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/hypersim_vis/rgb_cam_00_fr0002.png \
-  --output-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/1-epoch-not-valid-mask/inference/0002400 
-  """
+  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/lab_img \
+  --output-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/lab 
+"""

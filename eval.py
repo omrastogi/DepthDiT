@@ -176,7 +176,11 @@ if "__main__" == __name__:
         if not os.path.exists(pred_path):
             logging.warn(f"Can't find prediction: {pred_path}")
             continue
-        
+        # Ensure depth_raw_ts and depth_pred are float32
+        if depth_raw.dtype != torch.float32:
+            depth_raw = depth_raw.astype(np.float32)
+        if depth_pred.dtype != np.float32:
+            depth_pred = depth_pred.astype(np.float32)
         # Align with GT using least square
         if "least_square" == alignment:
             depth_pred, scale, shift = align_depth_least_square(

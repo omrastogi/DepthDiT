@@ -131,29 +131,6 @@ class DepthInference:
         rgb_norm = torch.from_numpy(rgb_norm).float().unsqueeze(0)  # [1, C, H, W]
         return rgb_norm
 
-    def load_images(self, path):
-        """Load a single image or all images from a directory."""
-        image_tensors = []
-        if os.path.isdir(path):
-            # Load all images from the directory
-            for filename in os.listdir(path):
-                if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    image_path = os.path.join(path, filename)
-                    logger.info(f"Loading image: {image_path}")
-                    image = Image.open(image_path)
-                    original_shape = image.size  # (width, height)
-                    image_tensor = self.get_rgb_norm(image).to(self.device)
-                    image_tensors.append((image_tensor, original_shape, filename))
-        else:
-            # Load the single image
-            image = Image.open(path)
-            original_shape = image.size  # (width, height)
-            image_tensor = self.get_rgb_norm(image).to(self.device)
-            filename = os.path.basename(path)
-            image_tensors.append((image_tensor, original_shape, filename))
-
-        return image_tensors
-
     def single_infer(self, rgb_batch):
         """Run inference to generate depth maps for a batch of images."""
         device = self.device
@@ -175,10 +152,17 @@ class DepthInference:
         model_kwargs = dict(y=y, cfg_scale=self.cfg_scale, input_img=rgb_input_latent)
 
         # Sample images from the diffusion model
-        samples = self.diffusion.p_sample_loop(
-            self.model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
-            model_kwargs=model_kwargs, progress=False, device=device
-        )
+        if args.scheduler == "ddim":
+            samples = self.diffusion.ddim_sample_loop(
+                self.model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
+                model_kwargs=model_kwargs, progress=False, device=device
+            )
+        elif args.scheduler == "ddpm":
+            samples = self.diffusion.p_sample_loop(
+                self.model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
+                model_kwargs=model_kwargs, progress=False, device=device
+            )
+
         samples, _ = samples.chunk(2, dim=0)  # Discard the unconditional samples
 
         # Decode the depth from latent space
@@ -194,26 +178,37 @@ class DepthInference:
 
     def pipe(self, input_image: Image.Image):
         """Process a single image through the inference pipeline."""
+
+        # Image preprocessing
         rgb_norm = self.get_rgb_norm(input_image).to(self.device)
         input_size = input_image.size  # Original size
 
         # Ensemble processing
         duplicated_rgb = rgb_norm.expand(self.ensemble_size, -1, -1, -1)
         single_rgb_dataset = TensorDataset(duplicated_rgb)
-
         single_rgb_loader = DataLoader(
             single_rgb_dataset, batch_size=self.batch_size, shuffle=False
         )
+        
+        import time
+
+        # Inference
         depth_pred_ls = []
+        start_time = time.time()
         for batch in single_rgb_loader:
             (batched_img,) = batch
-            depth_pred_raw = self.single_infer(
-                rgb_batch=batched_img,
-            )
+            with torch.no_grad():
+                with torch.cuda.amp.autocast():
+                    depth_pred_raw = self.single_infer(
+                        rgb_batch=batched_img,
+                    )
             depth_pred_ls.append(depth_pred_raw.detach())
         depth_preds = torch.concat(depth_pred_ls, dim=0)
         torch.cuda.empty_cache()  # Clear VRAM cache for ensembling
+        end_time = time.time()
+        print(f"Inference time: {end_time - start_time:.2f} seconds")
 
+        # Ensemble post-processing 
         if self.ensemble_size > 1:
             depth_pred, pred_uncert = ensemble_depth(
                 depth_preds,
@@ -229,23 +224,23 @@ class DepthInference:
             antialias=True,
         )
 
+        # Image Postprocessing
         depth_pred = depth_pred.squeeze()
         depth_pred = depth_pred.cpu().numpy()
 
         if pred_uncert is not None:
             pred_uncert = pred_uncert.squeeze().cpu().numpy()
 
-        # Clip output range
-        depth_pred = depth_pred.clip(0, 1)
-
-        # Colorize
-        depth_colored = colorize_depth_maps(
+        depth_pred = depth_pred.clip(0, 1)   # Clip output range
+        
+        depth_colored = colorize_depth_maps(  # Colorize
             depth_pred, 0, 1, cmap="Spectral"
         ).squeeze()  # [3, H, W], values in (0, 1)
 
         depth_colored = (depth_colored * 255).astype(np.uint8)
         depth_colored_hwc = chw2hwc(depth_colored)
         depth_colored_img = Image.fromarray(depth_colored_hwc)
+        
         return depth_pred, depth_colored_img, pred_uncert
 
     def initialize_model(self):
@@ -278,7 +273,11 @@ class DepthInference:
         diffusion = create_diffusion(str(self.args.num_sampling_steps))
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{self.args.vae}").to(device)
 
+
         logger.info("Model, diffusion, and VAE have been initialized.")
+        model = model.to(device).half()
+        vae = vae.to(device).half()
+
         return model, diffusion, vae
 
 def process_image(args):
@@ -296,6 +295,8 @@ def process_image(args):
         for batch in tqdm(
             dataloader, desc=f"Inferencing on {dataset.disp_name}", leave=True
         ):
+
+            # Main inference
             rgb_int = batch["rgb_int"].squeeze().numpy().astype(np.uint8)  # [3, H, W]
             rgb_int = np.moveaxis(rgb_int, 0, -1)  # [H, W, 3]
             input_image = Image.fromarray(rgb_int)
@@ -327,7 +328,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=512)
     parser.add_argument("--num-classes", type=int, default=1000) #TODO: Not required
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--num-sampling-steps", type=int, default=25)
@@ -339,20 +340,18 @@ if __name__ == "__main__":
     parser.add_argument("--ensemble-size", type=int, default=10, help="Size of the ensemble for depth prediction.")
     parser.add_argument("--dataset-config", type=str, required=True, help="Path to config file of evaluation dataset.")
     parser.add_argument("--base-data-dir", type=str, required=True, help="Path to base data directory.")
-
+    parser.add_argument("--scheduler", type=str, choices=["ddim", "ddpm"], default="ddim", help="Scheduler type to use for inference.")
     args = parser.parse_args()
     process_image(args)
 
 
 """
 python infer.py \
-  --model DiT-XL/2 \
-  --image-size 512 \
-  --batch-size 10 \
-  --num-sampling-steps 5\
-  --ensemble-size 1 \
-  --dataset-config config/new_benchmark_dataset/data_nyu_test.yaml \
-  --base-data-dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/eval_dataset \
-  --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/6-epochs/checkpoints/0014000.pt \
-  --output-dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/batch_eval/nyu_test/prediction 
+--batch-size 10 \
+--num-sampling-steps 50 \
+--ensemble-size 10 \
+--dataset-config config/dataset/data_nyu_test.yaml \
+--base-data-dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/Marigold/eval_dataset \
+--ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/results/6-epochs/checkpoints/0014000.pt \
+--output-dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/results/batch_eval/nyu_test/prediction
 """

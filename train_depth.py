@@ -152,7 +152,7 @@ def _replace_patchembed_proj(model):
 
 def validation(model, loader, vae, device, step, rank):
     print("Validation started")
-    diffusion = create_diffusion(str(25))
+    diffusion = create_diffusion(str(20))
     
     # Get the next batch
     batch = next(iter(loader))
@@ -179,7 +179,7 @@ def validation(model, loader, vae, device, step, rank):
     model_kwargs = dict(y=y, cfg_scale=cfg_scale, input_img=rgb_input_latent)
 
     # Sample images using the diffusion model
-    samples = diffusion.p_sample_loop(
+    samples = diffusion.ddim_sample_loop(
         model.module.forward_with_cfg, noise.shape, noise, 
         clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
     )

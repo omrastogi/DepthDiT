@@ -507,16 +507,33 @@ def main(args):
                 valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
             else:
                 valid_mask_down = None
-
-            y = torch.zeros(bsz, dtype=torch.long).to(device)
-
+            
             with torch.no_grad():
                 rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
                 x = encode_depth(depth_gt_for_latent, vae)
 
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+            y = torch.zeros(bsz, dtype=torch.long).to(device)
+            timesteps = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+
+
+            #TODO multi-res noise 
+            if config.multi_res_noise is not None:
+                strength = config.multi_res_noise.strength
+                if config.multi_res_noise.annealing:
+                    # calculate strength depending on t
+                    strength = strength * (timesteps / diffusion.num_timesteps)
+                    noise = multi_res_noise_like(
+                        x,
+                        strength=strength,
+                        downscale_strategy=config.multi_res_noise.downscale_strategy,
+                        # generator=rand_num_generator,
+                        device=device,
+                    )
+            else:
+                noise = None
+
             model_kwargs = dict(y=y, input_img=rgb_input_latent)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs, valid_mask_down) 
+            loss_dict = diffusion.training_losses(model, x, timesteps, model_kwargs, valid_mask_down, noise) 
             loss = loss_dict["loss"].mean()
 
             opt.zero_grad()

@@ -27,15 +27,18 @@ from torch.nn import Conv2d
 from torch.nn.parameter import Parameter
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 import wandb
 
+
 from src.diffusion import create_diffusion
-from src.dataset.base_depth_dataset import BaseDepthDataset, get_pred_name, DatasetMode  # noqa: F401
+from src.dataset import BaseDepthDataset, DatasetMode, get_dataset
 from src.dataset.depth_transform import get_depth_normalizer
+from src.dataset.dist_mixed_sampler import DistributedMixedBatchSampler
 from src.dataset.hypersim_dataset import HypersimDataset
+from src.util.multi_res_noise import multi_res_noise_like
 from src.models.models import DiT_models
 
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
@@ -75,11 +78,11 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def create_logger(logging_dir):
+def create_logger(logging_dir, rank):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if rank == 0:  # real logger
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -336,65 +339,106 @@ def create_and_initialize_model(args, device, rank, logger):
     
     return model, ema, diffusion, vae, optimizer_dict
 
-def create_datasets(config):
-    # Load dataset configuration
-    cfg_data_split = config.dataset.hypersim
+def create_datasets(cfg, args, rank, world_size):
+    loader_seed = args.global_seed
+    if loader_seed is None:
+        loader_generator = None
+    else:
+        loader_generator = torch.Generator().manual_seed(loader_seed)
+    
+    batch_size = int(args.global_batch_size // world_size)
 
-    # Load paths
-    base_data_dir = config.paths.base_data_dir
-    val_data_dir = config.paths.val_data_dir
-
-    # Create depth transform directly from the config
-    depth_transform = get_depth_normalizer(config.depth_transform)
-
-    # Augmentation arguments
-    augmentation_args = config.augmentation_args
-    kwargs = {
-        'augmentation_args': augmentation_args,
-        'depth_transform': depth_transform
-    }
-
-    # Print all the arguments
-    print("cfg_data_split:", cfg_data_split)
-    print("base_data_dir:", base_data_dir)
-    print("val_data_dir:", val_data_dir)
-    print("depth_transform:", depth_transform)
-    print("augmentation_args:", augmentation_args)
-    print("kwargs:", kwargs)
-
-    # Train dataset
-    train_dataset = HypersimDataset(
-        mode=DatasetMode.TRAIN,
-        filename_ls_path=cfg_data_split.filenames,
-        dataset_dir=os.path.join(base_data_dir, cfg_data_split.dir),
-        **cfg_data_split,
-        **kwargs,
+    # Training dataset
+    depth_transform = get_depth_normalizer(
+        cfg_normalizer=cfg.depth_normalization
     )
+    
+    train_dataset: BaseDepthDataset = get_dataset(
+        cfg.dataset.train,
+        base_data_dir=cfg.paths.base_data_dir,
+        mode=DatasetMode.TRAIN,
+        augmentation_args=cfg.augmentation,
+        depth_transform=depth_transform,
+    )
+    
+    if "mixed" == cfg.dataset.train.name:
+        dataset_ls = train_dataset
+        assert len(cfg.dataset.train.prob_ls) == len(
+            dataset_ls
+        ), "Lengths don't match: `prob_ls` and `dataset_list`"
+        concat_dataset = ConcatDataset(dataset_ls)
 
-    # Validation dataset
+        sampler = DistributedMixedBatchSampler(
+            src_dataset_ls=dataset_ls,
+            batch_size=batch_size,
+            drop_last=True,
+            shuffle=True,
+            world_size=world_size,
+            rank=rank,
+            prob=cfg.dataset.train.prob_ls,
+            generator=loader_generator,
+        )
+
+        train_loader = DataLoader(
+            concat_dataset,
+            batch_sampler=sampler,
+            num_workers=args.num_workers,
+        )
+    else:
+        sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.global_seed)
+
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            sampler=sampler,
+            batch_size=batch_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+            generator=loader_generator,
+        )
+
     val_dataset = HypersimDataset(
         mode=DatasetMode.TRAIN,  # since TRAIN changes the shape
-        filename_ls_path=os.path.join(val_data_dir, cfg_data_split.val_filenames),
-        dataset_dir=os.path.join(base_data_dir, cfg_data_split.val_dir),
-        **cfg_data_split,
-        **kwargs,
+        filename_ls_path=cfg.dataset.val.filenames,
+        dataset_dir=os.path.join(cfg.paths.base_data_dir, cfg.dataset.val.dir),
+        resize_to_hw=cfg.dataset.val.resize_to_hw,
+        disp_name=cfg.dataset.val.name,
+        depth_transform=depth_transform
     )
-    # return None, None
-    return train_dataset, val_dataset
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=3, 
+        num_workers=args.num_workers, 
+        pin_memory=True, 
+        drop_last=True
+    )
+    return train_loader, val_loader, sampler
+
+
 
 def main(args):
     """Trains a new DiT model"""
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
+    world_size = 1
+    rank = 0
+    device = 0
+    seed = args.global_seed
+
+    if dist.is_available():
+        dist.init_process_group("nccl")
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        device = rank % torch.cuda.device_count()
+        seed = args.global_seed * world_size + rank
+        torch.cuda.set_device(device)
+        print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
+    else:
+        dist.init_process_group(backend="nccl", rank=0, world_size=1)
+        print(f"Running on single GPU. seed={seed}")
+
+    # Set seed for reproducibility
     torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
     # Setup an experiment folder:
     if rank == 0:
@@ -404,10 +448,11 @@ def main(args):
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{args.training_label}--{datetime.now().strftime("%m%d-%H:%M:%S")}"
         checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
-        logger = create_logger(None)
+        logger = create_logger(None, rank)
+
 
     # Initialize WandB only if rank == 0 (main process)
     if rank == 0:
@@ -418,55 +463,20 @@ def main(args):
         )
 
     model, ema, diffusion, vae, optimizer_dict = create_and_initialize_model(args, device, rank, logger)
-    model = DDP(model.to(device), device_ids=[rank])
+
+    if dist.is_available() and dist.is_initialized():
+        model = DDP(model.to(device), device_ids=[device])
+    else:
+        model = model.to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if optimizer_dict is not None:
         opt.load_state_dict(optimizer_dict)
 
-    
-    #TODO: Read config.yaml 
-    # # Setup dataset:
-    # cfg_data_split = {
-    #     'name': 'hypersim',
-    #     'disp_name': 'hypersim_train',
-    #     'dir': 'Hypersim/processed/train',
-    #     'filenames': 'data_split/hypersim/filename_list_train_filtered.txt',
-    #     'resize_to_hw': [512, 512],
-    # }
+    config = load_config(args.config_path)
+    train_loader, val_loader, sampler = create_datasets(config, args, rank, world_size)
 
-    # depth_transform = get_depth_normalizer(SimpleNamespace(
-    #     type='scale_shift_depth', clip=True, norm_min=-1.0, norm_max=1.0, min_max_quantile=0.02))
-    # kwargs = {'augmentation_args': {'lr_flip_p': 0.5}, 'depth_transform': depth_transform}
-    # kwargs['augmentation_args'] = SimpleNamespace(**kwargs['augmentation_args'])
-
-    # train_dataset = HypersimDataset(
-    #     mode=DatasetMode.TRAIN,
-    #     filename_ls_path=cfg_data_split['filenames'],
-    #     dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", cfg_data_split['dir']),
-    #     **cfg_data_split,
-    #     **kwargs,
-    # )
-
-    # val_dataset = HypersimDataset(
-    #     mode=DatasetMode.TRAIN, # since TRAIN changes the shape
-    #     filename_ls_path="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data_split/hypersim/selected_vis_sample.txt",
-    #     dataset_dir=os.path.join("/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/data", "Hypersim/processed/val"),
-    #     **cfg_data_split,
-    #     **kwargs,
-    # )
-
-    config = load_config('config/config.yaml')
-    train_dataset, val_dataset = create_datasets(config)
-
-    bsz = int(args.global_batch_size // dist.get_world_size())
-
-    sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=rank, shuffle=True, seed=args.global_seed)
-    train_loader = DataLoader(train_dataset, batch_size=bsz, sampler=sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    
-    val_loader = DataLoader(val_dataset, batch_size=3, num_workers=args.num_workers, pin_memory=True, drop_last=True)
-
-    logger.info(f"Dataset contains {len(train_dataset):,} images")
+    bsz = int(args.global_batch_size // world_size)
     logger.info(f"Batch size: {bsz}")
 
     # Prepare models for training:
@@ -606,7 +616,6 @@ def colorize_depth_maps(
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -620,10 +629,12 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=500)
     parser.add_argument("--validation-every", type=int, default=200)
     parser.add_argument("--valid-mask-loss", action="store_true", help="Use valid mask loss")
-    parser.add_argument("--pretrained-path", type=str, default="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/checkpoints/DiT-XL-2-512x512.pt", help="Path to the pretrained model checkpoint")
+    parser.add_argument("--pretrained-path", type=str, default="/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/checkpoints/DiT-XL-2-512x512.pt", help="Path to the pretrained model checkpoint")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the optimizer")
     parser.add_argument("--weight-decay", type=float, default=0, help="Weight decay for the optimizer")
     parser.add_argument("--training-label", type=str, default="training", help="Label for the training session")
+    parser.add_argument("--config-path", type=str, default="config/training_config.yaml", help="Path of configuration script")
+
     args = parser.parse_args()
     main(args)
 
@@ -636,13 +647,12 @@ torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 
 torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
---epochs 6 \
---validation-every 1000 \
---global-batch-size 20 \
+--epochs 50 \
+--validation-every 50 \
+--global-batch-size 4 \
 --ckpt-every 2000 \
 --image-size 512 \
---pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/003-DiT-XL-2/checkpoints/0012000.pt \
---data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
+--config-path config/overfitting_config.yaml 
 '''
 
 
@@ -655,8 +665,8 @@ torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --global-batch-size 4 \
 --ckpt-every 5 \
 --image-size 512 \
---pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/6-epochs/checkpoints/0014000.pt \
---data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
+--pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/results/6-epochs/checkpoints/0014000.pt \
+--data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/data/imagenet/train
 '''
 
 

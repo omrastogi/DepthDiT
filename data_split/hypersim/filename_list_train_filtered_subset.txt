@@ -38,4 +38,3 @@ ai_001_001/rgb_cam_00_fr0037.png ai_001_001/depth_plane_cam_00_fr0037.png
 ai_001_001/rgb_cam_00_fr0038.png ai_001_001/depth_plane_cam_00_fr0038.png
 ai_001_001/rgb_cam_00_fr0039.png ai_001_001/depth_plane_cam_00_fr0039.png
 ai_001_001/rgb_cam_00_fr0040.png ai_001_001/depth_plane_cam_00_fr0040.png
-ai_001_001/rgb_cam_00_fr0041.png ai_001_001/depth_plane_cam_00_fr0041.png

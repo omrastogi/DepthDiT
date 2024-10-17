@@ -29,19 +29,19 @@ from tabulate import tabulate
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from dataset import (
+from src.dataset import (
     BaseDepthDataset,
     DatasetMode,
     get_dataset,
     get_pred_name,
 )
-from util import metric
-from util.alignment import (
+from src.util import metric
+from src.util.alignment import (
     align_depth_least_square,
     depth2disparity,
     disparity2depth,
 )
-from util.metric import MetricTracker
+from src.util.metric import MetricTracker
 
 eval_metrics = [
     "abs_relative_difference",
@@ -260,7 +260,7 @@ if "__main__" == __name__:
 """
 python eval.py \
     --base_data_dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/eval_dataset \
-    --dataset_config config/dataset/data_nyu_test.yaml \
+    --dataset_config config/new_benchmark_dataset/data_nyu_test.yaml \
     --alignment least_square \
     --prediction_dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/batch_eval/nyu_test/prediction \
     --output_dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/batch_eval/nyu_test/eval_metric \

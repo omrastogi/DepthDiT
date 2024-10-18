@@ -40,6 +40,7 @@ from src.dataset.dist_mixed_sampler import DistributedMixedBatchSampler
 from src.dataset.hypersim_dataset import HypersimDataset
 from src.util.multi_res_noise import multi_res_noise_like
 from src.models.models import DiT_models
+from pipeline import DepthPipeline
 
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -62,7 +63,6 @@ def update_ema(ema_model, model, decay=0.9999):
         # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
-
 def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
@@ -70,13 +70,15 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
-
 def cleanup():
     """
     End DDP training.
     """
     dist.destroy_process_group()
 
+#################################################################################
+#                             Pipeline Helper Functions                         #
+#################################################################################
 
 def create_logger(logging_dir, rank):
     """
@@ -94,7 +96,6 @@ def create_logger(logging_dir, rank):
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
     return logger
-
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -116,142 +117,6 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
-#################################################################################
-#                                  Depth Related Function                       #
-#################################################################################
-
-
-def _replace_patchembed_proj(model):
-    # https://github.com/prs-eth/Marigold/blob/518ab83a328ecbf57e7d63ec370e15dfa4336598/src/trainer/marigold_trainer.py#L169
-    # replace the first layer to accept 8 in_channels
-    _weight = model.x_embedder.proj.weight.clone()  # [320, 4, 3, 3]
-    _bias = model.x_embedder.proj.bias.clone()  # [320]
-    _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
-    # half the activation magnitude
-    _weight *= 0.5
-    # new proj channel
-    _n_proj_out_channel = model.x_embedder.proj.out_channels
-    kernel_size=model.x_embedder.proj.kernel_size
-    padding=model.x_embedder.proj.padding
-    stride=model.x_embedder.proj.stride
-    _new_proj = Conv2d(
-        8, _n_proj_out_channel, kernel_size=kernel_size, stride=stride, padding=padding
-    )
-    _new_proj.weight = Parameter(_weight)
-    _new_proj.bias = Parameter(_bias)
-    model.x_embedder.proj = _new_proj
-    print("PatchEmbed proj layer is replaced")
-    # replace config - Not required for DiT
-    # self.model.unet.config["in_channels"] = 8
-    # print("Unet config is updated")
-    return model
-
-#################################################################################
-#                                  Training Loop                                #
-#################################################################################
-
-def validation(model, loader, vae, device, step, rank):
-    print("Validation started")
-    diffusion = create_diffusion(str(20))
-    
-    # Get the next batch
-    batch = next(iter(loader))
-    rgb = batch["rgb_norm"].to(device)
-    rgb_int = batch["rgb_int"].to(device)  # Real RGB images from batch
-
-    # mentioning params
-    batch_size = rgb.shape[0]
-    cfg_scale = 4.0 # TODO: remove the hardcoding
-    
-    # Zero the class-conditioning
-    y = torch.zeros(batch_size, dtype=torch.long).to(device)
-    
-    with torch.no_grad(): # Map input images to latent space + normalize latents:
-        rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
-    
-    noise = torch.randn_like(rgb_input_latent, device=device)
-
-    # Setup classifier-free guidance:
-    noise = torch.cat([noise, noise], 0)
-    y_null = torch.tensor([1000] * batch_size, device=device)
-    y = torch.cat([y, y_null], 0)
-    rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0) # concating this as well
-    model_kwargs = dict(y=y, cfg_scale=cfg_scale, input_img=rgb_input_latent)
-
-    # Sample images using the diffusion model
-    samples = diffusion.ddim_sample_loop(
-        model.module.forward_with_cfg, noise.shape, noise, 
-        clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
-    )
-
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    
-    # Decode the depth from latent space
-    depth = decode_depth(samples, vae)
-    depth = torch.clip(depth, -1.0, 1.0)
-    
-    # Normalize depth values between 0 and 1
-    depth_pred = (depth + 1.0) / 2.0
-    depth_pred = depth_pred.squeeze()
-    
-    # Convert depth prediction to numpy array
-    depth_pred = depth_pred.detach().cpu().numpy()
-    depth_pred = depth_pred.clip(0, 1)
-    
-    # Colorize depth maps using a colormap
-    depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
-    
-    # Convert to uint8 for wandb logging
-    depth_colored = (depth_colored * 255).astype(np.uint8)
-    
-    # Log depth images and real images to wandb
-    wandb_images = []
-    for i in range(depth_colored.shape[0]):
-        depth_colored_hwc = chw2hwc(depth_colored[i])
-        # Log depth image to wandb
-        wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Depth Image {i}"))
-
-    # Also log real images from rgb_int
-    rgb_int_np = rgb_int.detach().cpu().numpy()
-    for i in range(rgb_int_np.shape[0]):
-        real_image_hwc = chw2hwc(rgb_int_np[i])
-        wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {i}"))
-
-    # Log to wandb
-    if rank == 0:
-        wandb.log({f"validation_images_step_{step}": wandb_images, "step": step})
-
-    # # Log as tabular in wandb
-    # table = wandb.Table(columns=["Real Image", "Depth Image"])
-
-    # # Get the numpy arrays for real images and depth images
-    # rgb_int_np = rgb_int.detach().cpu().numpy()
-    # depth_colored_np = depth_colored  # Already in numpy uint8 format
-
-    # # For each image in the batch
-    # for i in range(depth_colored_np.shape[0]):
-    #     # Convert the real image to HWC format
-    #     real_image_hwc = chw2hwc(rgb_int_np[i])
-    #     # Convert the depth image to HWC format
-    #     depth_colored_hwc = chw2hwc(depth_colored_np[i])
-        
-    #     # Create wandb.Image objects
-    #     real_image = wandb.Image(real_image_hwc, caption=f"Real Image {i}")
-    #     depth_image = wandb.Image(depth_colored_hwc, caption=f"Depth Image {i}")
-        
-    #     # Add a row to the table with the real image and depth image
-    #     table.add_data(real_image, depth_image)
-
-    # # Log the table to wandb
-    # wandb.log({f"validation_images_step_{step}": table, "step": step})
-
-
-    print("Validation completed and images logged to wandb.")
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-
 def chw2hwc(chw):
     assert 3 == len(chw.shape)
     if isinstance(chw, torch.Tensor):
@@ -259,7 +124,6 @@ def chw2hwc(chw):
     elif isinstance(chw, np.ndarray):
         hwc = np.moveaxis(chw, 0, -1)
     return hwc
-
 
 def decode_depth(depth_latent, vae):
     """Decode depth latent into depth map"""
@@ -276,313 +140,6 @@ def load_config(config_path):
     # Load configuration using OmegaConf
     config = OmegaConf.load(config_path)
     return config
-
-
-def create_and_initialize_model(args, device, rank, logger):
-    """
-    Create and initialize the model, EMA model, and other components.
-    Args:
-        args: Arguments containing model parameters and paths.
-        device: The device (CPU or GPU) to load the model on.
-        rank: The rank for DistributedDataParallel (DDP).
-        logger: Logger for logging information.
-    Returns:
-        Tuple containing the model, EMA model, diffusion, VAE, and optimizer (if available).
-    """
-    # Create model:
-    assert args.image_size % 8 == 0, "Image size must be divisible by 8."
-    latent_size = args.image_size // 8
-    model = DiT_models[args.model](input_size=latent_size, num_classes=args.num_classes)
-
-    # Load the checkpoint
-    checkpoint = torch.load(args.pretrained_path, map_location=lambda storage, loc: storage)
-
-    if "model" in checkpoint:  # Check if it's a checkpoint saved during training
-        state_dict_model = checkpoint["model"]
-    else:
-        state_dict_model = checkpoint
-
-    # Check if the checkpoint is for a Depth-DiT model
-    if "is_depth" in checkpoint:
-        # The state_dict is already modified for depth, so modify the model first
-        model = _replace_patchembed_proj(model)
-        # Load the state_dict into the model
-        model.load_state_dict(state_dict_model)
-    else:
-        # For a vanilla DiT model:
-        # Load the state_dict first, and then modify the model afterwards
-        model.load_state_dict(state_dict_model)
-        model = _replace_patchembed_proj(model)
-    
-    # Create EMA model and set it as non-trainable
-    ema = deepcopy(model).to(device)  # EMA model
-    requires_grad(ema, False)
-
-    # If the checkpoint has the EMA state, load it
-    if "ema" in checkpoint:
-        ema.load_state_dict(checkpoint["ema"])
-        logger.info("EMA state loaded from checkpoint.")
-
-    # Initialize the optimizer only if the optimizer state is present in the checkpoint
-    
-    if "iteration" in checkpoint:
-        train_step = checkpoint["iteration"]
-    else:
-        train_step = 0
-        # logger.info("Optimizer state loaded from checkpoint.")
-    
-    if "opt" in checkpoint:
-        optimizer_dict = checkpoint["opt"]
-    else:
-        optimizer_dict = None
-
-    diffusion = create_diffusion(timestep_respacing="")
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    return model, ema, diffusion, vae, optimizer_dict, train_step
-
-def create_datasets(cfg, args, rank, world_size):
-    loader_seed = args.global_seed
-    if loader_seed is None:
-        loader_generator = None
-    else:
-        loader_generator = torch.Generator().manual_seed(loader_seed)
-    
-    batch_size = int(args.global_batch_size // world_size)
-
-    # Training dataset
-    depth_transform = get_depth_normalizer(
-        cfg_normalizer=cfg.depth_normalization
-    )
-    
-    train_dataset: BaseDepthDataset = get_dataset(
-        cfg.dataset.train,
-        base_data_dir=cfg.paths.base_data_dir,
-        mode=DatasetMode.TRAIN,
-        augmentation_args=cfg.augmentation,
-        depth_transform=depth_transform,
-    )
-    
-    if "mixed" == cfg.dataset.train.name:
-        dataset_ls = train_dataset
-        assert len(cfg.dataset.train.prob_ls) == len(
-            dataset_ls
-        ), "Lengths don't match: `prob_ls` and `dataset_list`"
-        concat_dataset = ConcatDataset(dataset_ls)
-
-        sampler = DistributedMixedBatchSampler(
-            src_dataset_ls=dataset_ls,
-            batch_size=batch_size,
-            drop_last=True,
-            shuffle=True,
-            world_size=world_size,
-            rank=rank,
-            prob=cfg.dataset.train.prob_ls,
-            generator=loader_generator,
-        )
-
-        train_loader = DataLoader(
-            concat_dataset,
-            batch_sampler=sampler,
-            num_workers=args.num_workers,
-        )
-    else:
-        sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.global_seed)
-
-        train_loader = DataLoader(
-            dataset=train_dataset,
-            sampler=sampler,
-            batch_size=batch_size,
-            num_workers=args.num_workers,
-            shuffle=True,
-            generator=loader_generator,
-        )
-
-    val_dataset = HypersimDataset(
-        mode=DatasetMode.TRAIN,  # since TRAIN changes the shape
-        filename_ls_path=cfg.dataset.val.filenames,
-        dataset_dir=os.path.join(cfg.paths.base_data_dir, cfg.dataset.val.dir),
-        resize_to_hw=cfg.dataset.val.resize_to_hw,
-        disp_name=cfg.dataset.val.name,
-        depth_transform=depth_transform
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=3, 
-        num_workers=args.num_workers, 
-        pin_memory=True, 
-        drop_last=True
-    )
-    return train_loader, val_loader, sampler
-
-
-
-def main(args):
-    """Trains a new DiT model"""
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-
-    world_size = 1
-    rank = 0
-    device = 0
-    seed = args.global_seed
-
-    if dist.is_available():
-        dist.init_process_group("nccl")
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
-        device = rank % torch.cuda.device_count()
-        seed = args.global_seed * world_size + rank
-        torch.cuda.set_device(device)
-        print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
-    else:
-        dist.init_process_group(backend="nccl", rank=0, world_size=1)
-        print(f"Running on single GPU. seed={seed}")
-
-    # Set seed for reproducibility
-    torch.manual_seed(seed)
-
-    # Setup an experiment folder:
-    if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{args.training_label}--{datetime.now().strftime("%m%d-%H:%M:%S")}"
-        checkpoint_dir = f"{experiment_dir}/checkpoints"
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir, rank)
-        logger.info(f"Experiment directory created at {experiment_dir}")
-    else:
-        logger = create_logger(None, rank)
-
-
-    # Initialize WandB only if rank == 0 (main process)
-    if rank == 0:
-        wandb.init(
-            project="DiT-Training",  # Replace with your WandB project name
-            name=f"{args.model}-{args.image_size}-{args.training_label}-{datetime.now().strftime("%m%d-%H:%M:%S")}",
-            config=vars(args),
-        )
-
-    model, ema, diffusion, vae, optimizer_dict, train_step = create_and_initialize_model(args, device, rank, logger)
-
-    if dist.is_available() and dist.is_initialized():
-        model = DDP(model.to(device), device_ids=[device])
-    else:
-        model = model.to(device)
-
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    if optimizer_dict is not None:
-        opt.load_state_dict(optimizer_dict)
-
-    config = load_config(args.config_path)
-    train_loader, val_loader, sampler = create_datasets(config, args, rank, world_size)
-
-    bsz = int(args.global_batch_size // world_size)
-    logger.info(f"Batch size: {bsz}")
-
-    # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Initialize EMA
-    model.train()
-    ema.eval()
-
-    # Variables for monitoring/logging purposes:
-    log_steps, running_loss = 0, 0
-    epoch=0
-    logger.info(f"Training for {args.iterations} iterations...")
-    
-    train_loader_iter = iter(train_loader)
-
-    for train_step in tqdm(range(train_step, args.iterations), initial=train_step, total=args.iterations, desc="Training Progress"):
-        if train_step % len(train_loader) == 0:
-            epoch+=1
-            sampler.set_epoch(epoch)
-            train_loader_iter = iter(train_loader)
-
-        batch = next(train_loader_iter)
-        
-        rgb = batch["rgb_norm"].to(device)
-        depth_gt_for_latent = batch['depth_raw_norm'].to(device)
-
-        if args.valid_mask_loss:
-            valid_mask_for_latent = batch['valid_mask_raw'].to(device)
-            invalid_mask = ~valid_mask_for_latent
-            valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
-        else:
-            valid_mask_down = None
-        
-        with torch.no_grad():
-            rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
-            x = encode_depth(depth_gt_for_latent, vae)
-
-        y = torch.zeros(bsz, dtype=torch.long).to(device)
-        timesteps = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-
-        if config.multi_res_noise is not None:
-            strength = config.multi_res_noise.strength
-            if config.multi_res_noise.annealing:
-                # calculate strength depending on t
-                strength = strength * (timesteps / diffusion.num_timesteps)
-                noise = multi_res_noise_like(
-                    x,
-                    strength=strength,
-                    downscale_strategy=config.multi_res_noise.downscale_strategy,
-                    # generator=rand_num_generator,
-                    device=device,
-                )
-        else:
-            noise = None
-
-        """Testing the noise"""
-        # randn_noise = torch.randn_like(x)
-        # logger.info(f"Mean of noise: {noise.mean().item() if noise is not None else 'None'}, Mean of randn_noise: {randn_noise.mean().item()}")
-        
-        model_kwargs = dict(y=y, input_img=rgb_input_latent)
-        loss_dict = diffusion.training_losses(model, x, timesteps, model_kwargs, valid_mask_down, noise) 
-        loss = loss_dict["loss"].mean()
-
-        opt.zero_grad()
-
-        #TODO should this be there in the codebase
-        clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        loss.backward()
-        opt.step()
-        update_ema(ema, model.module)
-
-        # Logging
-        running_loss += loss.item()
-        log_steps += 1
-        train_step += 1
-
-        avg_loss = running_loss / log_steps
-        if rank == 0:
-            wandb.log({"smooth_loss": avg_loss, "train_loss": loss.item(), "step": train_step, "epoch": epoch})
-
-        # Validation
-        if train_step % args.validation_every == 0 and rank == 0: 
-            validation(model, val_loader, vae, device, train_step, rank)
-        
-        # Save checkpoints:
-        if train_step % args.ckpt_every == 0 and train_step > 0:
-            if rank == 0:
-                checkpoint = {
-                    "model": model.module.state_dict(),
-                    "ema": ema.state_dict(),
-                    "opt": opt.state_dict(),
-                    "args": args,
-                    "is_depth": True,
-                    "iteration": train_step
-                }
-                checkpoint_path = f"{checkpoint_dir}/{train_step:07d}.pt"
-                torch.save(checkpoint, checkpoint_path)
-                logger.info(f"Saved checkpoint to {checkpoint_path}")
-            dist.barrier()
-
-    logger.info("Training complete!")
-    cleanup()
 
 # Modified from Marigold: https://github.com/prs-eth/Marigold/blob/62413d56099d36573b2de1eb8c429839734b7782/src/trainer/marigold_trainer.py#L387
 def encode_depth(depth_in, vae):
@@ -640,6 +197,548 @@ def colorize_depth_maps(
 
     return img_colored
 
+
+#################################################################################
+#                                  DepthTrainer Class                           #
+#################################################################################
+
+class DepthTrainer:
+    def __init__(self, args):
+        self.args = args
+
+        assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+
+        if dist.is_available():
+            dist.init_process_group("nccl")
+            self.world_size = dist.get_world_size()
+            self.rank = dist.get_rank()
+            self.device = self.rank % torch.cuda.device_count()
+            self.seed = args.global_seed * self.world_size + self.rank
+            torch.cuda.set_device(self.device)
+            print(f"Starting rank={self.rank}, seed={self.seed}, world_size={self.world_size}.")
+        else:
+            dist.init_process_group(backend="nccl", rank=0, world_size=1)
+            self.world_size = 1
+            self.rank = 0
+            self.device = 0
+            self.seed = args.global_seed
+            print(f"Running on single GPU. seed={self.seed}")
+
+        # Set seed for reproducibility
+        torch.manual_seed(self.seed)
+
+        self.config = load_config(self.args.config_path)
+
+        # Setup an experiment folder:
+        if self.rank == 0:
+            os.makedirs(args.results_dir, exist_ok=True)
+            experiment_index = len(glob(f"{args.results_dir}/*"))
+            model_string_name = args.model.replace("/", "-")
+            experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}-{args.training_label}--{datetime.now().strftime('%m%d-%H:%M:%S')}"
+            checkpoint_dir = f"{experiment_dir}/checkpoints"
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            self.experiment_dir = experiment_dir
+            self.checkpoint_dir = checkpoint_dir
+            self.logger = create_logger(experiment_dir, self.rank)
+            self.logger.info(f"Experiment directory created at {experiment_dir}")
+        else:
+            self.experiment_dir = None
+            self.checkpoint_dir = None
+            self.logger = create_logger(None, self.rank)
+
+        # Initialize WandB only if rank == 0 (main process)
+        if self.rank == 0:
+            wandb.init(
+                project="DiT-Training",  # Replace with your WandB project name
+                name=f"{args.model}-{args.image_size}-{args.training_label}-{datetime.now().strftime('%m%d-%H:%M:%S')}",
+                config=vars(args),
+            )
+
+        self.batch_size = int(args.global_batch_size // self.world_size)
+        self.logger.info(f"Batch size: {self.batch_size}")
+
+        # Initialize model, ema, optimizer, etc.
+        self.create_and_initialize_model()
+        # Create datasets
+        self.create_datasets()
+
+        # Prepare DDP
+        if dist.is_available() and dist.is_initialized():
+            self.model = DDP(self.model.to(self.device), device_ids=[self.device])
+        else:
+            self.model = self.model.to(self.device)
+
+        self.opt = torch.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        if self.optimizer_dict is not None:
+            self.opt.load_state_dict(self.optimizer_dict)
+
+        # # Start training
+        # self.train()
+
+    def _replace_patchembed_proj(self):
+        # Replace the first layer to accept 8 in_channels
+        _weight = self.model.x_embedder.proj.weight.clone()  # [320, 4, 3, 3]
+        _bias = self.model.x_embedder.proj.bias.clone()  # [320]
+        _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
+        # Half the activation magnitude
+        _weight *= 0.5
+        # New proj channel
+        _n_proj_out_channel = self.model.x_embedder.proj.out_channels
+        kernel_size = self.model.x_embedder.proj.kernel_size
+        padding = self.model.x_embedder.proj.padding
+        stride = self.model.x_embedder.proj.stride
+        _new_proj = Conv2d(
+            8, _n_proj_out_channel, kernel_size=kernel_size, stride=stride, padding=padding
+        )
+        _new_proj.weight = Parameter(_weight)
+        _new_proj.bias = Parameter(_bias)
+        self.model.x_embedder.proj = _new_proj
+        print("PatchEmbed proj layer is replaced")
+
+    def create_and_initialize_model(self):
+        """
+        Create and initialize the model, EMA model, and other components.
+        Assigns them directly to class variables.
+        """
+        # Create model:
+        assert self.args.image_size % 8 == 0, "Image size must be divisible by 8."
+        latent_size = self.args.image_size // 8
+        self.model = DiT_models[self.args.model](input_size=latent_size, num_classes=self.args.num_classes)
+
+        # Load the checkpoint
+        checkpoint = torch.load(self.args.pretrained_path, map_location=lambda storage, loc: storage)
+
+        if "model" in checkpoint:  # Check if it's a checkpoint saved during training
+            state_dict_model = checkpoint["model"]
+        else:
+            state_dict_model = checkpoint
+
+        # Check if the checkpoint is for a Depth-DiT model
+        if "is_depth" in checkpoint:
+            # The state_dict is already modified for depth, so modify the model first
+            self._replace_patchembed_proj()
+            # Load the state_dict into the model
+            self.model.load_state_dict(state_dict_model)
+        else:
+            # For a vanilla DiT model:
+            # Load the state_dict first, and then modify the model afterwards
+            self.model.load_state_dict(state_dict_model)
+            self._replace_patchembed_proj()
+
+        # Create EMA model and set it as non-trainable
+        self.ema = deepcopy(self.model).to(self.device)  # EMA model
+        requires_grad(self.ema, False)
+
+        # If the checkpoint has the EMA state, load it
+        if "ema" in checkpoint:
+            self.ema.load_state_dict(checkpoint["ema"])
+            self.logger.info("EMA state loaded from checkpoint.")
+
+        # Initialize the optimizer only if the optimizer state is present in the checkpoint
+        if "iteration" in checkpoint:
+            self.train_step = checkpoint["iteration"]
+        else:
+            self.train_step = 0
+
+        if "opt" in checkpoint:
+            self.optimizer_dict = checkpoint["opt"]
+        else:
+            self.optimizer_dict = None
+
+        self.diffusion = create_diffusion(timestep_respacing="")
+        self.vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{self.args.vae}").to(self.device)
+
+        self.logger.info(f"DiT Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+
+    def create_datasets(self):
+        loader_seed = self.args.global_seed
+        if loader_seed is None:
+            loader_generator = None
+        else:
+            loader_generator = torch.Generator().manual_seed(loader_seed)
+
+        cfg = self.config
+
+        # Training dataset
+        depth_transform = get_depth_normalizer(
+            cfg_normalizer=cfg.depth_normalization
+        )
+
+        train_dataset: BaseDepthDataset = get_dataset(
+            cfg.dataset.train,
+            base_data_dir=cfg.paths.base_data_dir,
+            mode=DatasetMode.TRAIN,
+            augmentation_args=cfg.augmentation,
+            depth_transform=depth_transform,
+        )
+
+        if "mixed" == cfg.dataset.train.name:
+            dataset_ls = train_dataset
+            assert len(cfg.dataset.train.prob_ls) == len(
+                dataset_ls
+            ), "Lengths don't match: `prob_ls` and `dataset_list`"
+            concat_dataset = ConcatDataset(dataset_ls)
+
+            self.sampler = DistributedMixedBatchSampler(
+                src_dataset_ls=dataset_ls,
+                batch_size=self.batch_size,
+                drop_last=True,
+                shuffle=True,
+                world_size=self.world_size,
+                rank=self.rank,
+                prob=cfg.dataset.train.prob_ls,
+                generator=loader_generator,
+            )
+
+            self.train_loader = DataLoader(
+                concat_dataset,
+                batch_sampler=self.sampler,
+                num_workers=self.args.num_workers,
+            )
+        else:
+            self.sampler = DistributedSampler(train_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=True, seed=self.args.global_seed)
+
+            self.train_loader = DataLoader(
+                dataset=train_dataset,
+                sampler=self.sampler,
+                batch_size=self.batch_size,
+                num_workers=self.args.num_workers,
+                shuffle=True,
+                generator=loader_generator,
+            )
+
+        val_dataset = HypersimDataset(
+            mode=DatasetMode.EVAL,  # Since TRAIN changes the shape
+            filename_ls_path=cfg.dataset.val.filenames,
+            dataset_dir=os.path.join(cfg.paths.base_data_dir, cfg.dataset.val.dir),
+            resize_to_hw=cfg.dataset.val.resize_to_hw,
+            disp_name=cfg.dataset.val.name,
+            depth_transform=depth_transform
+        )
+
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.config.validation.batch_size,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+
+    # def validation(self):
+    #     print("Validation started")
+    #     diffusion = create_diffusion(str(self.config.validation.diffusion_steps))  # Or use self.diffusion if needed
+
+    #     # Get the next batch
+    #     batch = next(iter(self.val_loader))
+    #     rgb = batch["rgb_norm"].to(self.device)
+    #     rgb_int = batch["rgb_int"].to(self.device)  # Real RGB images from batch
+
+    #     # Mentioning params
+    #     batch_size = rgb.shape[0]
+    #     cfg_scale = self.config.validation.cfg_scale 
+
+    #     # Zero the class-conditioning
+    #     y = torch.zeros(batch_size, dtype=torch.long).to(self.device)
+
+    #     with torch.no_grad():  # Map input images to latent space + normalize latents:
+    #         rgb_input_latent = self.vae.encode(rgb).latent_dist.sample().mul_(0.18215)
+
+    #     noise = torch.randn_like(rgb_input_latent, device=self.device)
+
+    #     # Setup classifier-free guidance:
+    #     noise = torch.cat([noise, noise], 0)
+    #     y_null = torch.tensor([1000] * batch_size, device=self.device)
+    #     y = torch.cat([y, y_null], 0)
+    #     rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0)  # Concatenating this as well
+    #     model_kwargs = dict(y=y, cfg_scale=cfg_scale, input_img=rgb_input_latent)
+
+    #     # Sample images using the diffusion model
+    #     samples = diffusion.ddim_sample_loop(
+    #         self.model.module.forward_with_cfg, noise.shape, noise,
+    #         clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=self.device
+    #     )
+
+    #     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+
+    #     # Decode the depth from latent space
+    #     depth = decode_depth(samples, self.vae)
+    #     depth = torch.clip(depth, -1.0, 1.0)
+
+    #     # Normalize depth values between 0 and 1
+    #     depth_pred = (depth + 1.0) / 2.0
+    #     depth_pred = depth_pred.squeeze()
+
+    #     # Convert depth prediction to numpy array
+    #     depth_pred = depth_pred.detach().cpu().numpy()
+    #     depth_pred = depth_pred.clip(0, 1)
+
+    #     # Colorize depth maps using a colormap
+    #     depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+    #     depth_colored = (depth_colored * 255).astype(np.uint8) # Convert to uint8 for wandb logging
+
+    #     # Log depth images and real images to wandb
+    #     wandb_images = []
+    #     for i in range(depth_colored.shape[0]):
+    #         depth_colored_hwc = chw2hwc(depth_colored[i])
+    #         # Log depth image to wandb
+    #         wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Depth Image {i}"))
+
+    #     # Also log real images from rgb_int
+    #     rgb_int_np = rgb_int.detach().cpu().numpy()
+    #     for i in range(rgb_int_np.shape[0]):
+    #         real_image_hwc = chw2hwc(rgb_int_np[i])
+    #         wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {i}"))
+
+    #     # Log to wandb
+    #     if self.rank == 0:
+    #         wandb.log({f"validation_images_step_{self.train_step}": wandb_images, "step": self.train_step})
+
+    #     print("Validation completed and images logged to wandb.")
+    #     gc.collect()
+    #     torch.cuda.empty_cache()
+
+    def validation(self):
+        print("Validation started")
+        diffusion = create_diffusion(str(self.config.validation.diffusion_steps))  # Or use self.diffusion if needed
+
+        # Get the next batch
+        # batch = next(iter(self.val_loader))
+        # rgb = batch["rgb_norm"].to(self.device)
+        # rgb_int = batch["rgb_int"].to(self.device)  # Real RGB images from batch
+
+        # # Mentioning params
+        # batch_size = rgb.shape[0]
+        pipe = DepthPipeline(
+            batch_size=self.config.validation.batch_size,
+            cfg_scale=self.config.validation.cfg_scale,
+            ensemble_size=1,
+            num_sampling_steps=self.config.validation.diffusion_steps,
+            scheduler=self.config.validation.scheduler,
+            model=self.model.module,
+            vae=self.vae,
+            diffusion=diffusion
+        )
+        depth_pred, depth_colored, pred_uncert = None, None, None
+        depth_colored, images = [], []
+        for batch in self.val_loader:
+            # depth_pred, depth_colored_img, pred_uncert
+            rgb_int = batch["rgb_int"].to(self.device)
+            for rgb in range(rgb_int.shape[0]):
+                image = Image.fromarray(rgb_int[rgb].cpu().numpy().transpose(1, 2, 0).astype(np.uint8))
+                depth_pred, depth_colored_img, pred_uncert = pipe.pipe(image) 
+                depth_colored.append(depth_colored_img)
+                images.append(image)
+
+            
+
+
+        
+        # Log depth images and real images to wandb
+        wandb_images = []
+        for i, depth_colored_img in enumerate(depth_colored):
+            # Log depth image to wandb
+            wandb_images.append(wandb.Image(depth_colored_img, caption=f"Depth Image {i}"))
+
+        # Also log real images from rgb_int
+        # rgb_int_np = rgb_int.detach().cpu().numpy()
+        for i, rgb in enumerate(images):
+            wandb_images.append(wandb.Image(rgb, caption=f"Real Image {i}"))
+
+        # Log to wandb
+        if self.rank == 0:
+            wandb.log({f"validation_images_step_{self.train_step}": wandb_images, "step": self.train_step})
+
+        print("Validation completed and images logged to wandb.")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def train(self):
+
+        # Prepare models for training:
+        update_ema(self.ema, self.model.module, decay=0)  # Initialize EMA
+        self.model.train()
+        self.ema.eval()
+
+        # Variables for monitoring/logging purposes:
+        log_steps, running_loss = 0, 0
+        epoch = 0
+        self.logger.info(f"Training for {self.args.iterations} iterations...")
+
+        train_loader_iter = iter(self.train_loader)
+
+        for train_step in tqdm(range(self.train_step, self.args.iterations), initial=self.train_step, total=self.args.iterations, desc="Training Progress"):
+            if train_step % len(self.train_loader) == 0:
+                epoch += 1
+                self.sampler.set_epoch(epoch)
+                train_loader_iter = iter(self.train_loader)
+
+            batch = next(train_loader_iter)
+
+            rgb = batch["rgb_norm"].to(self.device)
+            depth_gt_for_latent = batch['depth_raw_norm'].to(self.device)
+
+            if self.args.valid_mask_loss:
+                valid_mask_for_latent = batch['valid_mask_raw'].to(self.device)
+                invalid_mask = ~valid_mask_for_latent
+                valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
+            else:
+                valid_mask_down = None
+
+            with torch.no_grad():
+                rgb_input_latent = self.vae.encode(rgb).latent_dist.sample().mul_(0.18215)
+                x = encode_depth(depth_gt_for_latent, self.vae)
+
+            y = torch.zeros(self.batch_size, dtype=torch.long).to(self.device)
+            timesteps = torch.randint(0, self.diffusion.num_timesteps, (x.shape[0],), device=self.device)
+
+            if self.config.multi_res_noise is not None:
+                strength = self.config.multi_res_noise.strength
+                if self.config.multi_res_noise.annealing:
+                    # Calculate strength depending on t
+                    strength = strength * (timesteps / self.diffusion.num_timesteps)
+                    noise = multi_res_noise_like(
+                        x,
+                        strength=strength,
+                        downscale_strategy=self.config.multi_res_noise.downscale_strategy,
+                        device=self.device,
+                    )
+            else:
+                noise = None
+
+            model_kwargs = dict(y=y, input_img=rgb_input_latent)
+            loss_dict = self.diffusion.training_losses(self.model, x, timesteps, model_kwargs, valid_mask_down, noise)
+            loss = loss_dict["loss"].mean()
+
+            self.opt.zero_grad()
+            clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            loss.backward()
+            self.opt.step()
+            update_ema(self.ema, self.model.module)
+
+            # Logging
+            running_loss += loss.item()
+            log_steps += 1
+            train_step += 1
+
+            avg_loss = running_loss / log_steps
+            if self.rank == 0:
+                wandb.log({"smooth_loss": avg_loss, "train_loss": loss.item(), "step": train_step, "epoch": epoch})
+
+            # Validation
+            if train_step % self.args.validation_every == 0 and self.rank == 0:
+                self.validation()
+
+            # Save checkpoints:
+            if train_step % self.args.ckpt_every == 0 and train_step > 0:
+                if self.rank == 0:
+                    checkpoint = {
+                        "model": self.model.module.state_dict(),
+                        "ema": self.ema.state_dict(),
+                        "opt": self.opt.state_dict(),
+                        "args": self.args,
+                        "is_depth": True,
+                        "iteration": train_step
+                    }
+                    checkpoint_path = f"{self.checkpoint_dir}/{train_step:07d}.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    self.logger.info(f"Saved checkpoint to {checkpoint_path}")
+                dist.barrier()
+
+        self.logger.info("Training complete!")
+        cleanup()
+
+    # def validate_single_dataset(
+    #     self,
+    #     data_loader: DataLoader,
+    #     metric_tracker: MetricTracker,
+    #     save_to_dir: str = None,
+    # ):
+    #     self.model.to(self.device)
+    #     metric_tracker.reset()
+
+    #     # Generate seed sequence for consistent evaluation
+    #     val_init_seed = self.cfg.validation.init_seed
+    #     val_seed_ls = generate_seed_sequence(val_init_seed, len(data_loader))
+
+    #     for i, batch in enumerate(
+    #         tqdm(data_loader, desc=f"evaluating on {data_loader.dataset.disp_name}"),
+    #         start=1,
+    #     ):
+    #         assert 1 == data_loader.batch_size
+    #         # Read input image
+    #         rgb_int = batch["rgb_int"].squeeze()  # [3, H, W]
+    #         # GT depth
+    #         depth_raw_ts = batch["depth_raw_linear"].squeeze()
+    #         depth_raw = depth_raw_ts.numpy()
+    #         depth_raw_ts = depth_raw_ts.to(self.device)
+    #         valid_mask_ts = batch["valid_mask_raw"].squeeze()
+    #         valid_mask = valid_mask_ts.numpy()
+    #         valid_mask_ts = valid_mask_ts.to(self.device)
+
+    #         # Random number generator
+    #         seed = val_seed_ls.pop()
+    #         if seed is None:
+    #             generator = None
+    #         else:
+    #             generator = torch.Generator(device=self.device)
+    #             generator.manual_seed(seed)
+
+    #         # Predict depth
+    #         pipe_out: MarigoldDepthOutput = self.model(
+    #             rgb_int,
+    #             denoising_steps=self.cfg.validation.denoising_steps,
+    #             ensemble_size=self.cfg.validation.ensemble_size,
+    #             processing_res=self.cfg.validation.processing_res,
+    #             match_input_res=self.cfg.validation.match_input_res,
+    #             generator=generator,
+    #             batch_size=1,  # use batch size 1 to increase reproducibility
+    #             color_map=None,
+    #             show_progress_bar=False,
+    #             resample_method=self.cfg.validation.resample_method,
+    #         )
+
+    #         depth_pred: np.ndarray = pipe_out.depth_np
+
+    #         if "least_square" == self.cfg.eval.alignment:
+    #             depth_pred, scale, shift = align_depth_least_square(
+    #                 gt_arr=depth_raw,
+    #                 pred_arr=depth_pred,
+    #                 valid_mask_arr=valid_mask,
+    #                 return_scale_shift=True,
+    #                 max_resolution=self.cfg.eval.align_max_res,
+    #             )
+    #         else:
+    #             raise RuntimeError(f"Unknown alignment type: {self.cfg.eval.alignment}")
+
+    #         # Clip to dataset min max
+    #         depth_pred = np.clip(
+    #             depth_pred,
+    #             a_min=data_loader.dataset.min_depth,
+    #             a_max=data_loader.dataset.max_depth,
+    #         )
+
+    #         # clip to d > 0 for evaluation
+    #         depth_pred = np.clip(depth_pred, a_min=1e-6, a_max=None)
+
+    #         # Evaluate
+    #         sample_metric = []
+    #         depth_pred_ts = torch.from_numpy(depth_pred).to(self.device)
+
+    #         for met_func in self.metric_funcs:
+    #             _metric_name = met_func.__name__
+    #             _metric = met_func(depth_pred_ts, depth_raw_ts, valid_mask_ts).item()
+    #             sample_metric.append(_metric.__str__())
+    #             metric_tracker.update(_metric_name, _metric)
+
+    #         # Save as 16-bit uint png
+    #         if save_to_dir is not None:
+    #             img_name = batch["rgb_relative_path"][0].replace("/", "_")
+    #             png_save_path = os.path.join(save_to_dir, f"{img_name}.png")
+    #             depth_to_save = (pipe_out.depth_np * 65535.0).astype(np.uint16)
+    #             Image.fromarray(depth_to_save).save(png_save_path, mode="I;16")
+
+    #     return metric_tracker.result()
+
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
@@ -664,7 +763,9 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=1000)
 
     args = parser.parse_args()
-    main(args)
+    # main(args)
+    trainer = DepthTrainer(args)
+    trainer.train()
 
 '''
 torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 20 --validation-every 5 --global-batch-size 4 --ckpt-every 20 --image-size 512 --data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/imagenet/train
@@ -672,13 +773,13 @@ torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 
 
 # For two gpus
 '''
-torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
+torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
---validation-every 50 \
---iteration 100 \
+--validation-every 10 \
+--iteration 30 \
 --global-batch-size 4 \
---ckpt-every 2000 \
+--ckpt-every 10 \
 --image-size 512 \
 --config-path config/overfitting_config.yaml 
 '''

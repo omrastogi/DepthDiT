@@ -324,20 +324,24 @@ def create_and_initialize_model(args, device, rank, logger):
         logger.info("EMA state loaded from checkpoint.")
 
     # Initialize the optimizer only if the optimizer state is present in the checkpoint
-    optimizer_dict = None
-    if "opt" in checkpoint:
-        optimizer_dict = checkpoint["opt"]
-        # Define the optimizer (make sure to match this with your training setup)
-        # optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        # optimizer.load_state_dict(checkpoint["opt"])
+    
+    if "iteration" in checkpoint:
+        train_step = checkpoint["iteration"]
+    else:
+        train_step = 0
         # logger.info("Optimizer state loaded from checkpoint.")
     
+    if "opt" in checkpoint:
+        optimizer_dict = checkpoint["opt"]
+    else:
+        optimizer_dict = None
+
     diffusion = create_diffusion(timestep_respacing="")
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    return model, ema, diffusion, vae, optimizer_dict
+    return model, ema, diffusion, vae, optimizer_dict, train_step
 
 def create_datasets(cfg, args, rank, world_size):
     loader_seed = args.global_seed
@@ -462,7 +466,7 @@ def main(args):
             config=vars(args),
         )
 
-    model, ema, diffusion, vae, optimizer_dict = create_and_initialize_model(args, device, rank, logger)
+    model, ema, diffusion, vae, optimizer_dict, train_step = create_and_initialize_model(args, device, rank, logger)
 
     if dist.is_available() and dist.is_initialized():
         model = DDP(model.to(device), device_ids=[device])
@@ -485,91 +489,97 @@ def main(args):
     ema.eval()
 
     # Variables for monitoring/logging purposes:
-    train_steps, log_steps, running_loss = 0, 0, 0
+    log_steps, running_loss = 0, 0
+    epoch=0
+    logger.info(f"Training for {args.iterations} iterations...")
+    
+    train_loader_iter = iter(train_loader)
 
-    logger.info(f"Training for {args.epochs} epochs...")
-    
-    # if rank == 0:
-    #     validation(model, val_loader, vae, device, train_steps, rank)
-    
-    for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
-        logger.info(f"Beginning epoch {epoch}...")
+    for train_step in tqdm(range(train_step, args.iterations), initial=train_step, total=args.iterations, desc="Training Progress"):
+        if train_step % len(train_loader) == 0:
+            epoch+=1
+            sampler.set_epoch(epoch)
+            train_loader_iter = iter(train_loader)
+
+        batch = next(train_loader_iter)
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            # Training step:
-            rgb = batch["rgb_norm"].to(device)
-            depth_gt_for_latent = batch['depth_raw_norm'].to(device)
+        rgb = batch["rgb_norm"].to(device)
+        depth_gt_for_latent = batch['depth_raw_norm'].to(device)
 
-            if args.valid_mask_loss:
-                valid_mask_for_latent = batch['valid_mask_raw'].to(device)
-                invalid_mask = ~valid_mask_for_latent
-                valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
-            else:
-                valid_mask_down = None
-            
-            with torch.no_grad():
-                rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
-                x = encode_depth(depth_gt_for_latent, vae)
+        if args.valid_mask_loss:
+            valid_mask_for_latent = batch['valid_mask_raw'].to(device)
+            invalid_mask = ~valid_mask_for_latent
+            valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
+        else:
+            valid_mask_down = None
+        
+        with torch.no_grad():
+            rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(0.18215)
+            x = encode_depth(depth_gt_for_latent, vae)
 
-            y = torch.zeros(bsz, dtype=torch.long).to(device)
-            timesteps = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+        y = torch.zeros(bsz, dtype=torch.long).to(device)
+        timesteps = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
 
+        if config.multi_res_noise is not None:
+            strength = config.multi_res_noise.strength
+            if config.multi_res_noise.annealing:
+                # calculate strength depending on t
+                strength = strength * (timesteps / diffusion.num_timesteps)
+                noise = multi_res_noise_like(
+                    x,
+                    strength=strength,
+                    downscale_strategy=config.multi_res_noise.downscale_strategy,
+                    # generator=rand_num_generator,
+                    device=device,
+                )
+        else:
+            noise = None
 
-            #TODO multi-res noise 
-            if config.multi_res_noise is not None:
-                strength = config.multi_res_noise.strength
-                if config.multi_res_noise.annealing:
-                    # calculate strength depending on t
-                    strength = strength * (timesteps / diffusion.num_timesteps)
-                    noise = multi_res_noise_like(
-                        x,
-                        strength=strength,
-                        downscale_strategy=config.multi_res_noise.downscale_strategy,
-                        # generator=rand_num_generator,
-                        device=device,
-                    )
-            else:
-                noise = None
+        """Testing the noise"""
+        # randn_noise = torch.randn_like(x)
+        # logger.info(f"Mean of noise: {noise.mean().item() if noise is not None else 'None'}, Mean of randn_noise: {randn_noise.mean().item()}")
+        
+        model_kwargs = dict(y=y, input_img=rgb_input_latent)
+        loss_dict = diffusion.training_losses(model, x, timesteps, model_kwargs, valid_mask_down, noise) 
+        loss = loss_dict["loss"].mean()
 
-            model_kwargs = dict(y=y, input_img=rgb_input_latent)
-            loss_dict = diffusion.training_losses(model, x, timesteps, model_kwargs, valid_mask_down, noise) 
-            loss = loss_dict["loss"].mean()
+        opt.zero_grad()
 
-            opt.zero_grad()
+        #TODO should this be there in the codebase
+        clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            clip_grad_norm_(model.parameters(), max_norm=1.0)
-            loss.backward()
-            opt.step()
-            update_ema(ema, model.module)
+        loss.backward()
+        opt.step()
+        update_ema(ema, model.module)
 
-            # Logging
-            running_loss += loss.item()
-            log_steps += 1
-            train_steps += 1
+        # Logging
+        running_loss += loss.item()
+        log_steps += 1
+        train_step += 1
 
-            avg_loss = running_loss / log_steps
+        avg_loss = running_loss / log_steps
+        if rank == 0:
+            wandb.log({"smooth_loss": avg_loss, "train_loss": loss.item(), "step": train_step, "epoch": epoch})
+
+        # Validation
+        if train_step % args.validation_every == 0 and rank == 0: 
+            validation(model, val_loader, vae, device, train_step, rank)
+        
+        # Save checkpoints:
+        if train_step % args.ckpt_every == 0 and train_step > 0:
             if rank == 0:
-                wandb.log({"train_loss": avg_loss, "step": train_steps, "epoch": epoch})
-
-            # Validation
-            if train_steps % args.validation_every == 0 and rank == 0: 
-                validation(model, val_loader, vae, device, train_steps, rank)
-            
-            # Save checkpoints:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args,
-                        "is_depth": True
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                checkpoint = {
+                    "model": model.module.state_dict(),
+                    "ema": ema.state_dict(),
+                    "opt": opt.state_dict(),
+                    "args": args,
+                    "is_depth": True,
+                    "iteration": train_step
+                }
+                checkpoint_path = f"{checkpoint_dir}/{train_step:07d}.pt"
+                torch.save(checkpoint, checkpoint_path)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
+            dist.barrier()
 
     logger.info("Training complete!")
     cleanup()
@@ -651,6 +661,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0, help="Weight decay for the optimizer")
     parser.add_argument("--training-label", type=str, default="training", help="Label for the training session")
     parser.add_argument("--config-path", type=str, default="config/training_config.yaml", help="Path of configuration script")
+    parser.add_argument("--iterations", type=int, default=1000)
 
     args = parser.parse_args()
     main(args)
@@ -661,11 +672,11 @@ torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 
 
 # For two gpus
 '''
-torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
+torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
---epochs 50 \
 --validation-every 50 \
+--iteration 100 \
 --global-batch-size 4 \
 --ckpt-every 2000 \
 --image-size 512 \

@@ -424,90 +424,9 @@ class DepthTrainer:
             drop_last=True
         )
 
-    # def validation(self):
-    #     print("Validation started")
-    #     diffusion = create_diffusion(str(self.config.validation.diffusion_steps))  # Or use self.diffusion if needed
-
-    #     # Get the next batch
-    #     batch = next(iter(self.val_loader))
-    #     rgb = batch["rgb_norm"].to(self.device)
-    #     rgb_int = batch["rgb_int"].to(self.device)  # Real RGB images from batch
-
-    #     # Mentioning params
-    #     batch_size = rgb.shape[0]
-    #     cfg_scale = self.config.validation.cfg_scale 
-
-    #     # Zero the class-conditioning
-    #     y = torch.zeros(batch_size, dtype=torch.long).to(self.device)
-
-    #     with torch.no_grad():  # Map input images to latent space + normalize latents:
-    #         rgb_input_latent = self.vae.encode(rgb).latent_dist.sample().mul_(0.18215)
-
-    #     noise = torch.randn_like(rgb_input_latent, device=self.device)
-
-    #     # Setup classifier-free guidance:
-    #     noise = torch.cat([noise, noise], 0)
-    #     y_null = torch.tensor([1000] * batch_size, device=self.device)
-    #     y = torch.cat([y, y_null], 0)
-    #     rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0)  # Concatenating this as well
-    #     model_kwargs = dict(y=y, cfg_scale=cfg_scale, input_img=rgb_input_latent)
-
-    #     # Sample images using the diffusion model
-    #     samples = diffusion.ddim_sample_loop(
-    #         self.model.module.forward_with_cfg, noise.shape, noise,
-    #         clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=self.device
-    #     )
-
-    #     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-
-    #     # Decode the depth from latent space
-    #     depth = decode_depth(samples, self.vae)
-    #     depth = torch.clip(depth, -1.0, 1.0)
-
-    #     # Normalize depth values between 0 and 1
-    #     depth_pred = (depth + 1.0) / 2.0
-    #     depth_pred = depth_pred.squeeze()
-
-    #     # Convert depth prediction to numpy array
-    #     depth_pred = depth_pred.detach().cpu().numpy()
-    #     depth_pred = depth_pred.clip(0, 1)
-
-    #     # Colorize depth maps using a colormap
-    #     depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
-    #     depth_colored = (depth_colored * 255).astype(np.uint8) # Convert to uint8 for wandb logging
-
-    #     # Log depth images and real images to wandb
-    #     wandb_images = []
-    #     for i in range(depth_colored.shape[0]):
-    #         depth_colored_hwc = chw2hwc(depth_colored[i])
-    #         # Log depth image to wandb
-    #         wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Depth Image {i}"))
-
-    #     # Also log real images from rgb_int
-    #     rgb_int_np = rgb_int.detach().cpu().numpy()
-    #     for i in range(rgb_int_np.shape[0]):
-    #         real_image_hwc = chw2hwc(rgb_int_np[i])
-    #         wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {i}"))
-
-    #     # Log to wandb
-    #     if self.rank == 0:
-    #         wandb.log({f"validation_images_step_{self.train_step}": wandb_images, "step": self.train_step})
-
-    #     print("Validation completed and images logged to wandb.")
-    #     gc.collect()
-    #     torch.cuda.empty_cache()
-
     def validation(self):
         print("Validation started")
-        diffusion = create_diffusion(str(self.config.validation.diffusion_steps))  # Or use self.diffusion if needed
 
-        # Get the next batch
-        # batch = next(iter(self.val_loader))
-        # rgb = batch["rgb_norm"].to(self.device)
-        # rgb_int = batch["rgb_int"].to(self.device)  # Real RGB images from batch
-
-        # # Mentioning params
-        # batch_size = rgb.shape[0]
         pipe = DepthPipeline(
             batch_size=self.config.validation.batch_size,
             cfg_scale=self.config.validation.cfg_scale,
@@ -516,9 +435,8 @@ class DepthTrainer:
             scheduler=self.config.validation.scheduler,
             model=self.model.module,
             vae=self.vae,
-            diffusion=diffusion
+            diffusion=create_diffusion(str(self.config.validation.diffusion_steps))
         )
-        depth_pred, depth_colored, pred_uncert = None, None, None
         depth_colored, images = [], []
         for batch in self.val_loader:
             # depth_pred, depth_colored_img, pred_uncert
@@ -528,19 +446,13 @@ class DepthTrainer:
                 depth_pred, depth_colored_img, pred_uncert = pipe.pipe(image) 
                 depth_colored.append(depth_colored_img)
                 images.append(image)
-
-            
-
-
         
         # Log depth images and real images to wandb
         wandb_images = []
         for i, depth_colored_img in enumerate(depth_colored):
-            # Log depth image to wandb
             wandb_images.append(wandb.Image(depth_colored_img, caption=f"Depth Image {i}"))
 
         # Also log real images from rgb_int
-        # rgb_int_np = rgb_int.detach().cpu().numpy()
         for i, rgb in enumerate(images):
             wandb_images.append(wandb.Image(rgb, caption=f"Real Image {i}"))
 
@@ -576,7 +488,7 @@ class DepthTrainer:
 
             rgb = batch["rgb_norm"].to(self.device)
             depth_gt_for_latent = batch['depth_raw_norm'].to(self.device)
-
+            print(rgb.shape)
             if self.args.valid_mask_loss:
                 valid_mask_for_latent = batch['valid_mask_raw'].to(self.device)
                 invalid_mask = ~valid_mask_for_latent
@@ -744,9 +656,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=512)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
@@ -761,9 +672,7 @@ if __name__ == "__main__":
     parser.add_argument("--training-label", type=str, default="training", help="Label for the training session")
     parser.add_argument("--config-path", type=str, default="config/training_config.yaml", help="Path of configuration script")
     parser.add_argument("--iterations", type=int, default=1000)
-
     args = parser.parse_args()
-    # main(args)
     trainer = DepthTrainer(args)
     trainer.train()
 
@@ -776,12 +685,13 @@ torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 
 torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
---validation-every 10 \
---iteration 30 \
+--validation-every 1000 \
+--iteration 20000 \
 --global-batch-size 4 \
---ckpt-every 10 \
---image-size 512 \
---config-path config/overfitting_config.yaml 
+--ckpt-every 2000 \
+--pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/checkpoints/model_vkitti_hypersim_4_epoch_multires/checkpoints/0014000.pt \
+--config-path config/training_config.yaml \
+--result-dir checkpoints
 '''
 
 
@@ -789,13 +699,10 @@ torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
---epochs 1 \
 --validation-every 1 \
 --global-batch-size 4 \
 --ckpt-every 5 \
 --image-size 512 \
---pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/results/6-epochs/checkpoints/0014000.pt \
---data-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/data/imagenet/train
 '''
 
 

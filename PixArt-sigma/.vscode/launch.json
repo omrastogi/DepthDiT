@@ -1,0 +1,54 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Inference Script",
+            "type": "python",
+            "request": "launch",
+            "program": "scripts/inference.py",
+            "console": "integratedTerminal",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "1"
+            },
+            "args": [
+                "--txt_file", "asset/samples_new.txt",
+                "--model_path", "/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/PixArt-Sigma-XL-2-1024-MS.pth"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Python Debugger: Training Script",
+            "type": "python",
+            "request": "launch",
+            "program": "train_scripts/train.py",
+            "console": "integratedTerminal",
+            "args": [
+                "configs/pixart_sigma_config/PixArt_sigma_xl2_img512_internalms.py",
+                "--load-from", "output/pretrained_models/PixArt-Sigma-XL-2-512-MS.pth",
+                "--work-dir", "output/your_first_pixart-exp",
+                "--debug",
+                "--report_to", "wandb"
+            ],
+            "justMyCode": false
+        },
+        {
+            "name": "Python Debugger: Depth Training Script",
+            "type": "python",
+            "request": "launch",
+            "program": "train_scripts/train_depth.py",
+            "console": "integratedTerminal",
+            "args": [
+                "configs/pixart_sigma_config/PixArt_sigma_xl2_img512_depth.py",
+                "--load-from", "output/pretrained_models/PixArt-Sigma-XL-2-512-MS.pth",
+                "--work-dir", "output/your_first_pixart-exp",
+                "--debug",
+                "--report_to", "wandb"
+            ],
+            "justMyCode": false
+        }
+
+    ]
+}

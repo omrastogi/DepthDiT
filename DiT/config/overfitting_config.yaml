@@ -1,0 +1,68 @@
+# dataset:
+#   hypersim:
+#     name: 'hypersim'
+#     disp_name: 'hypersim_train'
+#     dir: 'Hypersim/processed/train'
+#     filenames: 'data_split/hypersim/filename_list_train_filtered.txt'
+#     resize_to_hw: [512, 512]
+
+#     val_filenames: '/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/data_split/hypersim/selected_vis_sample.txt'
+#     val_dir: 'Hypersim/processed/val'
+
+dataset:
+  train:
+    name: mixed
+    prob_ls: [0.9, 0.1]
+    dataset_list:
+    - name: hypersim
+      disp_name: hypersim_train
+      dir: Hypersim/processed/train
+      # filenames: data_split/hypersim/filename_list_train_filtered.txt 
+      filenames: data_split/hypersim/filename_list_train_filtered_subset.txt # For overfitting
+      resize_to_hw: [512, 576]
+    - name: vkitti
+      disp_name: vkitti_train
+      dir: vkitti2
+      # filenames: data_split/vkitti/vkitti_train.txt
+      filenames: data_split/vkitti/vkitti_train_subset.txt
+      kitti_bm_crop: true
+      valid_mask_crop: null
+      resize_to_hw: [512, 576]
+
+  val:
+      name: hypersim
+      disp_name: hypersim_vis_small
+      dir: Hypersim/processed/train
+      filenames: data_split/hypersim/selected_vis_sample_subset.txt
+      resize_to_hw: [512, 512]
+
+depth_normalization:
+  type: scale_shift_depth
+  clip: true
+  norm_min: -1.0
+  norm_max: 1.0
+  min_max_quantile: 0.02
+
+augmentation:
+  lr_flip_p: 0.5
+
+multi_res_noise:
+  annealing: true
+  strength: 0.9
+  downscale_strategy: 'original'
+
+paths:
+  base_data_dir: '/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/Marigold/data'
+  val_data_dir: '/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT'
+
+dataloader:
+  num_workers: 1
+  effective_batch_size: 20 # Needed for grad accumulation
+  max_train_batch_size: 10 # Hence not using these values
+  seed: 2024  # to ensure continuity when resuming from checkpoint
+
+validation:
+  cfg_scale: 4.0
+  diffusion_steps: 10
+  diffusion_sceduler: 'ddim'
+  batch_size: 3

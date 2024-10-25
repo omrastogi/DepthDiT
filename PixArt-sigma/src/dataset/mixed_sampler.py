@@ -103,7 +103,6 @@ class MixedBatchSampler(BatchSampler):
             # shift by cumulative dataset length
             shift = self.cum_dataset_length[idx_ds]
             batch = [n + shift for n in batch_raw]
-            print("Sampled batch indices", batch)
             yield batch
 
     def __len__(self):

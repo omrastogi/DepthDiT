@@ -23,15 +23,18 @@ pe_interpolation = 1.0
 
 # training setting
 num_workers = 10
-train_batch_size = 3  # 48 as default
+train_batch_size = 4  # 48 as default
 num_epochs = 1000  # 3
 gradient_accumulation_steps = 4
 grad_checkpointing = True
 gradient_clip = 0.01
-optimizer = dict(type='CAMEWrapper', lr=2e-5, weight_decay=0.0, betas=(0.9, 0.999, 0.9999), eps=(1e-30, 1e-16))
+#TODO setup ADAMW 
+# optimizer = dict(type='CAMEWrapper', lr=2e-5, weight_decay=0.0, betas=(0.9, 0.999, 0.9999), eps=(1e-30, 1e-16))
+optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.0)
+
 lr_schedule_args = dict(num_warmup_steps=1000)
 
-eval_sampling_steps = 500
+eval_sampling_steps = 200
 visualize = True
 log_interval = 20
 save_model_epochs = 3000

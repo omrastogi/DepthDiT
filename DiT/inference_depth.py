@@ -180,10 +180,16 @@ def inference(args, rgb_batch, model, diffusion, vae, original_shapes):
     model_kwargs = dict(y=y, cfg_scale=args.cfg_scale, input_img=rgb_input_latent)
 
     # Sample images from the diffusion model
-    samples = diffusion.p_sample_loop(
-        model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
-        model_kwargs=model_kwargs, progress=True, device=device
-    )
+    if args.scheduler == "ddim":
+        samples = diffusion.ddim_sample_loop(
+            model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
+            model_kwargs=model_kwargs, progress=True, device=device
+        )
+    elif args.scheduler == "ddpm":
+        samples = diffusion.p_sample_loop(
+            model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
+            model_kwargs=model_kwargs, progress=True, device=device
+        )
     samples, _ = samples.chunk(2, dim=0)  # Discard the unconditional samples
 
     # Decode the depth from latent space
@@ -242,7 +248,6 @@ def initialize_model(args):
         model = _replace_patchembed_proj(model)
 
     # Load checkpoint
-    ckpt_path = args.ckpt
     checkpoint = torch.load(args.ckpt, map_location=lambda storage, loc: storage)
     if "model" in checkpoint:  # supports checkpoints from train.py
         state_dict = checkpoint["model"]
@@ -318,6 +323,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-path", type=str, required=True, help="Path to the output directory.")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for processing images.")
     parser.add_argument("--save-npy", action="store_true", help="Save depth as npy")
+    parser.add_argument("--scheduler", type=str, choices=["ddim", "ddpm"], default="ddim", help="Scheduler type to use for inference.")
     args = parser.parse_args()
     process_images(args)
 
@@ -343,8 +349,8 @@ python inference_depth.py \
   --model DiT-XL/2 \
   --image-size 512 \
   --batch-size 10 \
-  --num-sampling-steps 250 \
-  --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/1-epoch-not-valid-mask/checkpoints/0002400.pt \
-  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/data/lab_img \
-  --output-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/lab 
+  --num-sampling-steps 50 \
+  --ckpt /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/results/048-DiT-XL-2-training--1015-23:39:58/checkpoints/0014000.pt \
+  --image-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/data/lab_img \
+  --output-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/results/lab_mixed_training 
 """

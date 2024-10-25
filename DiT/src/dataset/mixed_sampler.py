@@ -103,7 +103,7 @@ class MixedBatchSampler(BatchSampler):
             # shift by cumulative dataset length
             shift = self.cum_dataset_length[idx_ds]
             batch = [n + shift for n in batch_raw]
-
+            print("Sampled batch indices", batch)
             yield batch
 
     def __len__(self):
@@ -126,9 +126,9 @@ if "__main__" == __name__:
         def __getitem__(self, index):
             return self.start + index
 
-    dataset_1 = SimpleDataset(0, 10)
-    dataset_2 = SimpleDataset(200, 20)
-    dataset_3 = SimpleDataset(1000, 50)
+    dataset_1 = SimpleDataset(0, 11)
+    dataset_2 = SimpleDataset(200, 21)
+    dataset_3 = SimpleDataset(1000, 51)
 
     concat_dataset = ConcatDataset(
         [dataset_1, dataset_2, dataset_3]
@@ -138,12 +138,13 @@ if "__main__" == __name__:
         src_dataset_ls=[dataset_1, dataset_2, dataset_3],
         batch_size=4,
         drop_last=True,
-        shuffle=False,
+        shuffle=True,
         prob=[0.6, 0.3, 0.1],
         generator=torch.Generator().manual_seed(0),
     )
 
     loader = DataLoader(concat_dataset, batch_sampler=mixed_sampler)
 
-    for d in loader:
-        print(d)
+    print("Total number of batches:", len(loader))
+    for i, d in enumerate(loader):
+        print(f"Batch {i+1}: {d.tolist()}")

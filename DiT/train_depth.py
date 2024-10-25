@@ -249,7 +249,7 @@ class DepthTrainer:
         # Initialize WandB only if rank == 0 (main process)
         if self.rank == 0:
             wandb.init(
-                project="DiT-Training",  # Replace with your WandB project name
+                project="DiT-Onestep-Training",  # Replace with your WandB project name
                 name=f"{args.model}-{args.image_size}-{args.training_label}-{datetime.now().strftime('%m%d-%H:%M:%S')}",
                 config=vars(args),
             )
@@ -426,7 +426,6 @@ class DepthTrainer:
 
     def validation(self):
         print("Validation started")
-
         pipe = DepthPipeline(
             batch_size=self.config.validation.batch_size,
             cfg_scale=self.config.validation.cfg_scale,
@@ -488,7 +487,6 @@ class DepthTrainer:
 
             rgb = batch["rgb_norm"].to(self.device)
             depth_gt_for_latent = batch['depth_raw_norm'].to(self.device)
-            print(rgb.shape)
             if self.args.valid_mask_loss:
                 valid_mask_for_latent = batch['valid_mask_raw'].to(self.device)
                 invalid_mask = ~valid_mask_for_latent
@@ -501,7 +499,9 @@ class DepthTrainer:
                 x = encode_depth(depth_gt_for_latent, self.vae)
 
             y = torch.zeros(self.batch_size, dtype=torch.long).to(self.device)
-            timesteps = torch.randint(0, self.diffusion.num_timesteps, (x.shape[0],), device=self.device)
+            # timesteps = torch.randint(0, self.diffusion.num_timesteps, (x.shape[0],), device=self.device)
+            # Create a tensor filled with the value 999
+            timesteps = torch.full((x.shape[0],), 999, device=self.device, dtype=torch.long)
 
             if self.config.multi_res_noise is not None:
                 strength = self.config.multi_res_noise.strength
@@ -685,13 +685,12 @@ torchrun --nnodes=1 --nproc_per_node=1 train_depth.py --model DiT-XL/2 --epochs 
 torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
---validation-every 1000 \
+--validation-every 500 \
 --iteration 20000 \
---global-batch-size 4 \
+--global-batch-size 20 \
 --ckpt-every 2000 \
---pretrained-path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/checkpoints/model_vkitti_hypersim_4_epoch_multires/checkpoints/0014000.pt \
 --config-path config/training_config.yaml \
---result-dir checkpoints
+--results-dir checkpoints
 '''
 
 

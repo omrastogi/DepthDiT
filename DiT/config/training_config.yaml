@@ -1,14 +1,3 @@
-# dataset:
-#   hypersim:
-#     name: 'hypersim'
-#     disp_name: 'hypersim_train'
-#     dir: 'Hypersim/processed/train'
-#     filenames: 'data_split/hypersim/filename_list_train_filtered.txt'
-#     resize_to_hw: [512, 512]
-
-#     val_filenames: '/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/data_split/hypersim/selected_vis_sample.txt'
-#     val_dir: 'Hypersim/processed/val'
-
 dataset:
   train:
     name: mixed
@@ -17,14 +6,12 @@ dataset:
     - name: hypersim
       disp_name: hypersim_train
       dir: Hypersim/processed/train
-      # filenames: data_split/hypersim/filename_list_train_filtered.txt 
-      filenames: data_split/hypersim/filename_list_train_filtered_subset.txt # For overfitting
+      filenames: data_split/hypersim/filename_list_train_filtered.txt 
       resize_to_hw: [512, 512]
     - name: vkitti
       disp_name: vkitti_train
       dir: vkitti2
-      # filenames: data_split/vkitti/vkitti_train.txt
-      filenames: data_split/vkitti/vkitti_train_subset.txt
+      filenames: data_split/vkitti/vkitti_train.txt
       kitti_bm_crop: true
       valid_mask_crop: null
       resize_to_hw: [512, 512]
@@ -32,8 +19,8 @@ dataset:
   val:
       name: hypersim
       disp_name: hypersim_vis_small
-      dir: Hypersim/processed/train
-      filenames: data_split/hypersim/selected_vis_sample_subset.txt
+      dir: Hypersim/processed/val
+      filenames: data_split/hypersim/selected_vis_sample.txt
       resize_to_hw: [512, 512]
 
 depth_normalization:
@@ -60,3 +47,9 @@ dataloader:
   effective_batch_size: 20 # Needed for grad accumulation
   max_train_batch_size: 10 # Hence not using these values
   seed: 2024  # to ensure continuity when resuming from checkpoint
+
+validation:
+  cfg_scale: 4.0
+  diffusion_steps: 1
+  scheduler: 'ddim'
+  batch_size: 3

@@ -1,0 +1,7 @@
+*.png
+/checkpoints
+/data
+/results
+/wandb
+/.vscode
+__pycache__/

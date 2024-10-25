@@ -152,12 +152,12 @@ class DepthInference:
         model_kwargs = dict(y=y, cfg_scale=self.cfg_scale, input_img=rgb_input_latent)
 
         # Sample images from the diffusion model
-        if args.scheduler == "ddim":
+        if self.args.scheduler == "ddim":
             samples = self.diffusion.ddim_sample_loop(
                 self.model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
                 model_kwargs=model_kwargs, progress=False, device=device
             )
-        elif args.scheduler == "ddpm":
+        elif self.args.scheduler == "ddpm":
             samples = self.diffusion.p_sample_loop(
                 self.model.forward_with_cfg, noise.shape, noise, clip_denoised=False,
                 model_kwargs=model_kwargs, progress=False, device=device
@@ -197,9 +197,14 @@ class DepthInference:
         start_time = time.time()
         for batch in single_rgb_loader:
             (batched_img,) = batch
-            with torch.no_grad():
-                with torch.cuda.amp.autocast():
-                    depth_pred_raw = self.single_infer(
+            if self.args.fp16:
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast():
+                        depth_pred_raw = self.single_infer(
+                            rgb_batch=batched_img,
+                        )
+            else:
+                depth_pred_raw = self.single_infer(
                         rgb_batch=batched_img,
                     )
             depth_pred_ls.append(depth_pred_raw.detach())
@@ -275,8 +280,9 @@ class DepthInference:
 
 
         logger.info("Model, diffusion, and VAE have been initialized.")
-        model = model.to(device).half()
-        vae = vae.to(device).half()
+        if self.args.fp16:
+            model = model.to(device).half()
+            vae = vae.to(device).half()
 
         return model, diffusion, vae
 
@@ -341,6 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset-config", type=str, required=True, help="Path to config file of evaluation dataset.")
     parser.add_argument("--base-data-dir", type=str, required=True, help="Path to base data directory.")
     parser.add_argument("--scheduler", type=str, choices=["ddim", "ddpm"], default="ddim", help="Scheduler type to use for inference.")
+    parser.add_argument("--fp16", action="store_true", help="Use FP16 precision for inference.")
     args = parser.parse_args()
     process_image(args)
 

@@ -1,10 +1,16 @@
 import os
 import sys
 from pathlib import Path
+
+import numpy as np
+
+
 current_file_path = Path(__file__).resolve()
-sys.path.insert(0, str(current_file_path.parent.parent))
+sys.path.insert(0, str(current_file_path.parent.parent))  # Ensure this points to the correct parent directory
 import warnings
 warnings.filterwarnings("ignore")  # ignore warning
+from src.utils.embedding_utils import save_null_caption_embeddings, load_null_caption_embeddings
+from src.utils.image_utils import chw2hwc, colorize_depth_maps, decode_depth
 import re
 import argparse
 from datetime import datetime
@@ -24,12 +30,18 @@ from diffusion.model.nets import PixArtMS_XL_2, PixArt_XL_2
 from diffusion.data.datasets import get_chunks
 import diffusion.data.datasets.utils as ds_utils
 
+import os
+from PIL import Image
+import torch
+from torchvision import transforms
+
+
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--image_size', default=1024, type=int)
     parser.add_argument('--version', default='sigma', type=str)
     parser.add_argument(
-        "--pipeline_load_from", default='output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
+        "--pipeline_load_from", default='/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
         type=str, help="Download for loading text_encoder, "
                        "tokenizer and vae from https://huggingface.co/PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers"
     )
@@ -44,17 +56,11 @@ def get_args():
     parser.add_argument('--step', default=-1, type=int)
     parser.add_argument('--save_name', default='test_sample', type=str)
     parser.add_argument('--input_dir',default='/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/data/hypersim_vis', type=str )
+    parser.add_argument('--is_depth', action='store_true')
 
     return parser.parse_args()
 
-import os
-from PIL import Image
-import torch
 
-import os
-from PIL import Image
-import torch
-from torchvision import transforms
 
 def load_images(path, device='cpu'):
     """
@@ -124,98 +130,6 @@ def set_env(seed=0):
     for _ in range(30):
         torch.randn(1, 4, args.image_size, args.image_size)
 
-# @torch.inference_mode()
-# def visualize(items, bs, sample_steps, cfg_scale, image_list):
-
-#     for chunk in tqdm(list(get_chunks(items, bs)), unit='batch'):
-
-#         prompts = []
-#         if bs == 1:
-#             save_path = os.path.join(save_root, f"{chunk[0][:100]}.jpg")
-#             if os.path.exists(save_path):
-#                 continue
-#             prompt_clean, _, hw, ar, custom_hw = prepare_prompt_ar(chunk[0], base_ratios, device=device, show=False)  # ar for aspect ratio
-#             if args.image_size == 1024:
-#                 latent_size_h, latent_size_w = int(hw[0, 0] // 8), int(hw[0, 1] // 8)
-#             else:
-#                 hw = torch.tensor([[args.image_size, args.image_size]], dtype=torch.float, device=device).repeat(bs, 1)
-#                 ar = torch.tensor([[1.]], device=device).repeat(bs, 1)
-#                 latent_size_h, latent_size_w = latent_size, latent_size
-#             prompts.append(prompt_clean.strip())
-#         else:
-#             hw = torch.tensor([[args.image_size, args.image_size]], dtype=torch.float, device=device).repeat(bs, 1)
-#             ar = torch.tensor([[1.]], device=device).repeat(bs, 1)
-#             for prompt in chunk:
-#                 prompts.append(prepare_prompt_ar(prompt, base_ratios, device=device, show=False)[0].strip())
-#             latent_size_h, latent_size_w = latent_size, latent_size
-
-#         caption_token = tokenizer(prompts, max_length=max_sequence_length, padding="max_length", truncation=True,
-#                                   return_tensors="pt").to(device)
-#         caption_embs = text_encoder(caption_token.input_ids, attention_mask=caption_token.attention_mask)[0]
-#         emb_masks = caption_token.attention_mask
-
-#         caption_embs = caption_embs[:, None]
-#         null_y = null_caption_embs.repeat(len(prompts), 1, 1)[:, None]
-#         print(f'finish embedding')
-
-#         with torch.no_grad():
-
-#             if args.sampling_algo == 'iddpm':
-#                 # Create sampling noise:
-#                 n = len(prompts)
-#                 z = torch.randn(n, 4, latent_size_h, latent_size_w, device=device).repeat(2, 1, 1, 1)
-#                 model_kwargs = dict(y=torch.cat([caption_embs, null_y]),
-#                                     cfg_scale=cfg_scale, data_info={'img_hw': hw, 'aspect_ratio': ar}, mask=emb_masks)
-#                 diffusion = IDDPM(str(sample_steps))
-#                 # Sample images:
-#                 samples = diffusion.p_sample_loop(
-#                     model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
-#                     device=device
-#                 )
-#                 samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-#             elif args.sampling_algo == 'dpm-solver':
-#                 # Create sampling noise:
-#                 n = len(prompts)
-#                 z = torch.randn(n, 4, latent_size_h, latent_size_w, device=device)
-#                 model_kwargs = dict(data_info={'img_hw': hw, 'aspect_ratio': ar}, mask=emb_masks)
-#                 dpm_solver = DPMS(model.forward_with_dpmsolver,
-#                                   condition=caption_embs,
-#                                   uncondition=null_y,
-#                                   cfg_scale=cfg_scale,
-#                                   model_kwargs=model_kwargs)
-#                 samples = dpm_solver.sample(
-#                     z,
-#                     steps=sample_steps,
-#                     order=2,
-#                     skip_type="time_uniform",
-#                     method="multistep",
-#                 )
-#             elif args.sampling_algo == 'sa-solver':
-#                 # Create sampling noise:
-#                 n = len(prompts)
-#                 model_kwargs = dict(data_info={'img_hw': hw, 'aspect_ratio': ar}, mask=emb_masks)
-#                 sa_solver = SASolverSampler(model.forward_with_dpmsolver, device=device)
-#                 samples = sa_solver.sample(
-#                     S=25,
-#                     batch_size=n,
-#                     shape=(4, latent_size_h, latent_size_w),
-#                     eta=1,
-#                     conditioning=caption_embs,
-#                     unconditional_conditioning=null_y,
-#                     unconditional_guidance_scale=cfg_scale,
-#                     model_kwargs=model_kwargs,
-#                 )[0]
-
-#         samples = samples.to(weight_dtype)
-#         samples = vae.decode(samples / vae.config.scaling_factor).sample
-#         torch.cuda.empty_cache()
-#         # Save images:
-#         os.umask(0o000)  # file permission: 666; dir permission: 777
-#         for i, sample in enumerate(samples):
-#             save_path = os.path.join(save_root, f"{i}.jpg")
-#             print("Saving path: ", save_path)
-#             save_image(sample, save_path, nrow=1, normalize=True, value_range=(-1, 1))
-
 def get_default_hw(ar_input, ratios, device='cpu'):
     """
     Finds the closest aspect ratio from the provided ratios dictionary and returns the default height and width.
@@ -249,109 +163,6 @@ def get_default_hw(ar_input, ratios, device='cpu'):
 
     return default_hw_tensor
 
-# @torch.inference_mode()
-# def visualize(items, bs, sample_steps, cfg_scale, image_list):
-#     bs = 1  # Fixed batch size
-
-#     for chunk in tqdm(list(get_chunks(items, bs)), unit='batch'):
-#         prompts = []
-
-#         # Since bs is always 1, we can assume bs == 1
-#         save_path = os.path.join(save_root, f"{chunk[0][:100]}.jpg")
-#         if os.path.exists(save_path):
-#             continue
-
-#         # Prepare the prompt and extract parameters
-#         prompt_clean, _, hw, ar, custom_hw = prepare_prompt_ar(
-#             chunk[0], base_ratios, device=device, show=False
-#         )  # 'ar' stands for aspect ratio
-
-#         if args.image_size == 1024:
-#             latent_size_h = int(hw[0, 0] // 8)
-#             latent_size_w = int(hw[0, 1] // 8)
-#         else:
-#             hw = torch.tensor(
-#                 [[args.image_size, args.image_size]],
-#                 dtype=torch.float,
-#                 device=device
-#             ).repeat(bs, 1)
-#             ar = torch.tensor([[1.0]], device=device).repeat(bs, 1)
-#             latent_size_h = latent_size
-#             latent_size_w = latent_size
-
-#         prompts.append(prompt_clean.strip())
-
-#         # Tokenize and encode the prompt
-#         caption_token = tokenizer(
-#             prompts,
-#             max_length=max_sequence_length,
-#             padding="max_length",
-#             truncation=True,
-#             return_tensors="pt"
-#         ).to(device)
-
-#         caption_embs = text_encoder(
-#             caption_token.input_ids,
-#             attention_mask=caption_token.attention_mask
-#         )[0]
-#         emb_masks = caption_token.attention_mask
-
-#         caption_embs = caption_embs[:, None]
-#         null_y = null_caption_embs.repeat(len(prompts), 1, 1)[:, None]
-#         print('Finished embedding')
-
-#         with torch.no_grad():
-#             n = len(prompts)
-#             model_kwargs = {
-#                 'data_info': {'img_hw': hw, 'aspect_ratio': ar},
-#                 'mask': emb_masks
-#             }
-
-#             if args.sampling_algo == 'dpm-solver':
-#                 # Create sampling noise
-#                 z = torch.randn(n, 4, latent_size_h, latent_size_w, device=device)
-#                 dpm_solver = DPMS(
-#                     model.forward_with_dpmsolver,
-#                     condition=caption_embs,
-#                     uncondition=null_y,
-#                     cfg_scale=cfg_scale,
-#                     model_kwargs=model_kwargs
-#                 )
-#                 samples = dpm_solver.sample(
-#                     z,
-#                     steps=sample_steps,
-#                     order=2,
-#                     skip_type="time_uniform",
-#                     method="multistep",
-#                 )
-
-#             elif args.sampling_algo == 'sa-solver':
-#                 # Create sampling noise
-#                 sa_solver = SASolverSampler(
-#                     model.forward_with_dpmsolver,
-#                     device=device
-#                 )
-#                 samples = sa_solver.sample(
-#                     S=25,
-#                     batch_size=n,
-#                     shape=(4, latent_size_h, latent_size_w),
-#                     eta=1,
-#                     conditioning=caption_embs,
-#                     unconditional_conditioning=null_y,
-#                     unconditional_guidance_scale=cfg_scale,
-#                     model_kwargs=model_kwargs,
-#                 )[0]
-
-#         samples = samples.to(weight_dtype)
-#         samples = vae.decode(samples / vae.config.scaling_factor).sample
-#         torch.cuda.empty_cache()
-
-#         # Save images
-#         os.umask(0o000)  # File permission: 666; dir permission: 777
-#         for i, sample in enumerate(samples):
-#             save_path = os.path.join(save_root, f"{i}.jpg")
-#             print("Saving path:", save_path)
-#             save_image(sample, save_path, nrow=1, normalize=True, value_range=(-1, 1))
 
 
 import os
@@ -416,6 +227,7 @@ def visualize(image_list, sample_steps, cfg_scale, save_root, ratios, device='cp
         # Prepare the hw tensor using the new function
         hw_str = f"{int(hw[0])}:{int(hw[1])}"  # Convert to 'height:width' string
         hw_tensor = get_default_hw(hw_str, ratios, device=device)
+    
         
         # Assuming latent_size is defined elsewhere based on image_size
         latent_size_h = int(hw_tensor[0, 0].item() // 8)
@@ -435,21 +247,6 @@ def visualize(image_list, sample_steps, cfg_scale, save_root, ratios, device='cp
         # Example prompt (since prompt is no longer used, you might need to adjust your model accordingly)
         prompts = [""]  # Placeholder if your model requires prompts
         
-        # Tokenize and encode the prompt
-        # caption_token = tokenizer(
-        #     prompts,
-        #     max_length=max_sequence_length,
-        #     padding="max_length",
-        #     truncation=True,
-        #     return_tensors="pt"
-        # ).to(device)
-        
-        # caption_embs = text_encoder(
-        #     caption_token.input_ids,
-        #     attention_mask=caption_token.attention_mask
-        # )[0]
-        # emb_masks = caption_token.attention_mask
-
         #TODO should I use them as None
         emb_masks = null_caption_token.attention_mask
         # emb_masks = None
@@ -528,15 +325,30 @@ def visualize(image_list, sample_steps, cfg_scale, save_root, ratios, device='cp
                 )[0]
         
         samples = samples.to(weight_dtype)
-        samples = vae.decode(samples / vae.config.scaling_factor).sample
+        depth = decode_depth(samples, vae)
+        depth = torch.clip(depth, -1.0, 1.0)  # TODO: Check this step
+
+        # Normalize depth values between 0 and 1
+        depth_pred = (depth + 1.0) / 2.0
+        depth_pred = depth_pred.squeeze().detach().cpu().numpy()
+        depth_pred = depth_pred.clip(0, 1)
+
+        # Colorize depth maps using a colormap
+        depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+
+        # Convert to uint8 for wandb logging
+        depth_colored = (depth_colored * 255).astype(np.uint8)
+        depth_colored_hwc = chw2hwc(depth_colored)
+        # depth_colored_hwc_tensor = torch.tensor(depth_colored_hwc, dtype=torch.uint8).permute(2, 0, 1).unsqueeze(0)
+
         torch.cuda.empty_cache()
         
         # Save images
         os.umask(0o000)  # File permission: 666; dir permission: 777
-        for i, sample in enumerate(samples):
-            save_path = os.path.join(save_root, f"{filename[:100]}_{i}.jpg")
-            print("Saving path:", save_path)
-            save_image(sample, save_path, nrow=1, normalize=True, value_range=(-1, 1))
+        save_path = os.path.join(save_root, f"{filename[:100]}.jpg")
+        print("Saving path:", save_path)
+        Image.fromarray(depth_colored_hwc).save(save_path)
+
 
 def _replace_patchembed_proj(model):
     """Replace the first layer to accept 8 in_channels."""
@@ -596,17 +408,26 @@ if __name__ == '__main__':
     state_dict = find_model(args.model_path)
     if 'pos_embed' in state_dict['state_dict']:
         del state_dict['state_dict']['pos_embed']
-    missing, unexpected = model.load_state_dict(state_dict['state_dict'], strict=False)
-    print('Missing keys: ', missing)
-    print('Unexpected keys', unexpected)
     # Replacing projection layer in PatchEmbed
     # model = _replace_patchembed_proj(model)
+    if args.is_depth:
+        # The state_dict is already modified for depth, so modify the model first
+        model = _replace_patchembed_proj(model)
+        missing, unexpected = model.load_state_dict(state_dict['state_dict'], strict=False)
+    else:
+        # For a vanilla DiT model:
+        # Load the state_dict first, and then modify the model afterwards
+        missing, unexpected = model.load_state_dict(state_dict['state_dict'], strict=False)
+        model = _replace_patchembed_proj(model)
+
+    print('Missing keys: ', missing)
+    print('Unexpected keys', unexpected)
 
     model.eval()
     model.to(weight_dtype)
 
-    if 8 != model.x_embedder.proj.weight.shape[1]:
-        model = _replace_patchembed_proj(model)
+    # if 8 != model.x_embedder.proj.weight.shape[1]:
+    #     model = _replace_patchembed_proj(model)
 
     # How do they decide the ratio
     base_ratios = getattr(ds_utils, f'ASPECT_RATIO_{args.image_size}', ds_utils.ASPECT_RATIO_1024)
@@ -618,11 +439,20 @@ if __name__ == '__main__':
         # pixart-Sigma vae link: https://huggingface.co/PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers/tree/main/vae
         vae = AutoencoderKL.from_pretrained(f"{args.pipeline_load_from}/vae").to(device).to(weight_dtype)
 
-    tokenizer = T5Tokenizer.from_pretrained(args.pipeline_load_from, subfolder="tokenizer")
-    text_encoder = T5EncoderModel.from_pretrained(args.pipeline_load_from, subfolder="text_encoder").to(device)
+    # tokenizer = T5Tokenizer.from_pretrained(args.pipeline_load_from, subfolder="tokenizer")
+    # text_encoder = T5EncoderModel.from_pretrained(args.pipeline_load_from, subfolder="text_encoder").to(device)
 
-    null_caption_token = tokenizer("", max_length=max_sequence_length, padding="max_length", truncation=True, return_tensors="pt").to(device)
-    null_caption_embs = text_encoder(null_caption_token.input_ids, attention_mask=null_caption_token.attention_mask)[0]
+    # null_caption_token = tokenizer("", max_length=max_sequence_length, padding="max_length", truncation=True, return_tensors="pt").to(device)
+    # null_caption_embs = text_encoder(null_caption_token.input_ids, attention_mask=null_caption_token.attention_mask)[0]
+
+    # Check if the .pt files exist, otherwise save them
+    save_dir = "output/null_embedding"
+    # if not (os.path.exists(os.path.join(save_dir, "null_caption_token.pt")) and
+    #         os.path.exists(os.path.join(save_dir, "null_caption_embs.pt"))):
+    #     save_null_caption_embeddings(args.pipeline_load_from, accelerator)
+
+    # Load the saved embeddings and tokens
+    null_caption_token, null_caption_embs = load_null_caption_embeddings(save_dir)
 
     work_dir = os.path.join(*args.model_path.split('/')[:-2])
     work_dir = '/'+work_dir if args.model_path[0] == '/' else work_dir
@@ -657,4 +487,5 @@ if __name__ == '__main__':
     os.makedirs(save_root, exist_ok=True)
     # visualize(items, args.bs, sample_steps, args.cfg_scale, image_list)
     visualize(image_list, sample_steps, args.cfg_scale, save_root, base_ratios, device=device)
+
 

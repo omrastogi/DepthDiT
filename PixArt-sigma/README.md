@@ -18,13 +18,39 @@ pip install -r requirements.txt
 
 # Training
 
+### Training from scratch
+
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m torch.distributed.launch --nproc_per_node=1 --master_port=12345 \
+
+python -m torch.distributed.launch --nproc_per_node=2 --master_port=12345 \
           train_scripts/train_depth.py \
           configs/pixart_sigma_config/PixArt_sigma_xl2_img512_depth.py \
-          --load-from output/pretrained_models/PixArt-Sigma-XL-2-512-MS.pth \
-          --work-dir output/your_first_pixart-exp \
+          --load-from /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/PixArt-Sigma-XL-2-1024-MS.pth \
+          --work-dir output/depth_512_mixed_training \
           --debug \
           --report_to wandb
 ```
+
+### Training a depth model
+```bash
+python -m torch.distributed.launch --nproc_per_node=2 --master_port=12345 \
+          train_scripts/train_depth.py \
+          configs/pixart_sigma_config/PixArt_sigma_xl2_img512_depth.py \
+          --load-from /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/PixArt-sigma/output/depth_mixed_training/checkpoints/epoch_3_step_14000.pth \
+          --work-dir output/depth_512_mixed_training \
+          --is_depth \
+          --debug \  
+          --report_to_wandb
+```
 ---
+
+# Inference 
+```bash
+python scripts/inference_depth.py \
+    --txt_file asset/samples_new.txt \
+    --model_path /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/PixArt-sigma/output/depth_512_mixed_training/checkpoints/epoch_5_step_20000.pth \
+    --cfg_scale 3.0 \
+    --is_depth \
+    --image_size 512
+
+```

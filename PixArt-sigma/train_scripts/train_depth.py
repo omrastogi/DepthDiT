@@ -47,6 +47,8 @@ from src.dataset.mixed_sampler import MixedBatchSampler
 from src.dataset.hypersim_dataset import HypersimDataset
 from src.utils.image_utils import decode_depth, colorize_depth_maps, chw2hwc, encode_depth
 from src.utils.embedding_utils import load_null_caption_embeddings, save_null_caption_embeddings
+from src.utils.multi_res_noise import multi_res_noise_like
+
 warnings.filterwarnings("ignore")  # ignore warning
 
 
@@ -199,7 +201,7 @@ def log_validation(model, loader, vae, device, step):
 
 
     # Log all images to wandb
-    wandb.log({f"validation_images_step_{step}": wandb_images, "step": step})
+    wandb.log({f"validation_images_step": wandb_images, "step": step})
 
     print("Validation completed and images logged to wandb.")
     gc.collect()
@@ -332,11 +334,20 @@ def train():
         rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=torch.float16)
         depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=torch.float16)
 
+        if config.valid_mask_loss:
+            valid_mask_for_latent = batch['valid_mask_raw']
+            invalid_mask = ~valid_mask_for_latent
+            valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
+            valid_mask_down = valid_mask_down.to(device=accelerator.device)
+
+        else:    
+            valid_mask_down = None
+
         # Encode inputs
         rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(config.scale_factor)
         depth_gt_latent = encode_depth(depth_gt_for_latent, vae)
 
-        del rgb, depth_gt_for_latent
+        del rgb, depth_gt_for_latent, valid_mask_for_latent
         torch.cuda.empty_cache()
 
         bs = rgb_input_latent.shape[0]
@@ -344,6 +355,20 @@ def train():
         timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=accelerator.device).long()
 
         data_time_all += time.time() - data_time_start
+
+        if config.multi_res_noise is not None:
+            strength = config.multi_res_noise_strength
+            if config.multi_res_noise_annealing:
+                # Calculate strength depending on t
+                strength = strength * (timesteps / train_diffusion.num_timesteps)
+                noise = multi_res_noise_like(
+                    depth_gt_latent,
+                    strength=strength,
+                    downscale_strategy=config.multi_res_noise_downscale_strategy,
+                    device=accelerator.device,
+                )
+        else:
+            noise = None
 
         # Training step
         with accelerator.accumulate(model):
@@ -356,7 +381,9 @@ def train():
                     y=y, 
                     mask=None,
                     input_latent=rgb_input_latent
-                )
+                ),
+                valid_mask=valid_mask_down,
+                noise=noise
             )
             loss = loss_term['loss'].mean()
             accelerator.backward(loss)
@@ -364,7 +391,7 @@ def train():
             if accelerator.sync_gradients:
                 grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
             optimizer.step()
-            update_ema(ema, model.module)
+            update_ema(ema, model)
             # lr_scheduler.step()
 
         # Logging
@@ -597,8 +624,6 @@ if __name__ == '__main__':
     
     ema = deepcopy(model).to(accelerator.device)  # EMA model
     requires_grad(ema, False)
-
-    # model = _replace_patchembed_proj(model)
     
     # prepare for FSDP clip grad norm calculation
     if accelerator.distributed_type == DistributedType.FSDP:
@@ -614,12 +639,6 @@ if __name__ == '__main__':
 
     # optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.optimizer["lr"], weight_decay=config.optimizer["weight_decay"])
-
-    # lr_scale_ratio = 1
-    # if config.get('auto_lr', None):
-    #     lr_scale_ratio = auto_scale_lr(config.train_batch_size * get_world_size() * config.gradient_accumulation_steps,
-    #                                    config.optimizer, **config.auto_lr)    
-    # lr_scheduler = build_lr_scheduler(config, optimizer, train_dataloader, lr_scale_ratio)
 
     lr_scheduler = None
 
@@ -661,8 +680,19 @@ if __name__ == '__main__':
 python -m torch.distributed.launch --nproc_per_node=2 --master_port=12345 \
           train_scripts/train_depth.py \
           configs/pixart_sigma_config/PixArt_sigma_xl2_img512_depth.py \
-          --load-from /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/PixArt-Sigma-XL-2-1024-MS.pth \
+          --load-from /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/PixArt-Sigma-XL-2-512-MS.pth \
           --work-dir output/depth_512_mixed_training \
+          --debug \
+          --report_to wandb
+"""
+
+"""
+python -m torch.distributed.launch --nproc_per_node=2 --master_port=12345 \
+          train_scripts/train_depth.py \
+          configs/pixart_sigma_config/PixArt_sigma_xl2_img512_depth.py \
+          --load-from /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/PixArt-sigma/output/depth_512_mixed_training_iter3/checkpoints/epoch_5_step_22000.pth \
+          --work-dir output/depth_512_mixed_training \
+          --is_depth \
           --debug \
           --report_to wandb
 """

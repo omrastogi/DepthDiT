@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from PIL import Image
 import matplotlib
+from torchvision.transforms import InterpolationMode
 
 
 # Modified from Marigold: https://github.com/prs-eth/Marigold/blob/62413d56099d36573b2de1eb8c429839734b7782/src/trainer/marigold_trainer.py#L387
@@ -100,3 +101,49 @@ def colorize_depth_maps(
         img_colored = img_colored_np
 
     return img_colored
+
+def get_tv_resample_method(method_str: str) -> InterpolationMode:
+    resample_method_dict = {
+        "bilinear": InterpolationMode.BILINEAR,
+        "bicubic": InterpolationMode.BICUBIC,
+        "nearest": InterpolationMode.NEAREST_EXACT,
+        "nearest-exact": InterpolationMode.NEAREST_EXACT,
+    }
+    resample_method = resample_method_dict.get(method_str, None)
+    if resample_method is None:
+        raise ValueError(f"Unknown resampling method: {resample_method}")
+    else:
+        return resample_method
+
+def resize_max_res(
+    img: torch.Tensor,
+    max_edge_resolution: int,
+    resample_method: InterpolationMode = InterpolationMode.BILINEAR,
+) -> torch.Tensor:
+    """
+    Resize image to limit maximum edge length while keeping aspect ratio.
+
+    Args:
+        img (`torch.Tensor`):
+            Image tensor to be resized. Expected shape: [B, C, H, W]
+        max_edge_resolution (`int`):
+            Maximum edge length (pixel).
+        resample_method (`PIL.Image.Resampling`):
+            Resampling method used to resize images.
+
+    Returns:
+        `torch.Tensor`: Resized image.
+    """
+    assert 4 == img.dim(), f"Invalid input shape {img.shape}"
+
+    original_height, original_width = img.shape[-2:]
+    downscale_factor = min(
+        max_edge_resolution / original_width, max_edge_resolution / original_height
+    )
+
+    new_width = int(original_width * downscale_factor)
+    new_height = int(original_height * downscale_factor)
+
+    resized_img = resize(img, (new_height, new_width), resample_method, antialias=True)
+    return resized_img
+

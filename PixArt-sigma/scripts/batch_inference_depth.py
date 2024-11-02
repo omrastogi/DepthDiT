@@ -165,6 +165,9 @@ def pipe(image_tensor, hw, ensemble_size=10, batch_size=5, device='cpu'):
     depth_preds = torch.cat(depth_pred_ls, dim=0)  # Shape: [batch_size, 1, H, W]
     depth_pred = depth_preds.mean(dim=0, keepdim=True)  # Shape: [1, 1, H, W]
 
+    depth_pred = F.interpolate(
+        depth_pred.float(), size=hw, mode='bilinear', align_corners=False
+    )
     # Post-processing
     depth_pred = depth_pred.squeeze().cpu().numpy()  # Shape: [H, W]
     depth_pred = depth_pred.clip(0, 1)
@@ -175,7 +178,6 @@ def pipe(image_tensor, hw, ensemble_size=10, batch_size=5, device='cpu'):
     # Convert to uint8 and HWC format
     depth_colored = (depth_colored * 255).astype(np.uint8).squeeze()
     depth_colored_hwc = chw2hwc(depth_colored)
-
     return depth_pred, depth_colored_hwc
 
 @torch.inference_mode()
@@ -350,11 +352,69 @@ def get_args():
     parser.add_argument('--config_path', default='configs/dataset/data_nyu_test.yaml', type=str, help="Path to the configuration file.")
     return parser.parse_args()
 
+def check_and_save_config_summary(args):
+    """
+    Checks if the configuration summary already exists and validates it against the current arguments.
+    If not present, saves the current configuration to a new file.
+
+    Args:
+        args (argparse.Namespace): Parsed command line arguments.
+        config_summary_path (str): Path to save the configuration summary.
+
+    Raises:
+        AssertionError: If an existing configuration summary has mismatched values.
+    """
+    config_summary_path = os.path.join(args.output_dir, "inference_config_summary.txt")
+    # If configuration file exists, validate existing values
+    if os.path.exists(config_summary_path):
+        with open(config_summary_path, 'r') as existing_config_file:
+            existing_config = existing_config_file.read()
+
+        # Extract values of each parameter in existing config
+        existing_values = {
+            "Model Path": args.model_path,
+            "CFG Scale": args.cfg_scale,
+            "Sampling Algorithm": args.sampling_algo,
+            "Steps": args.step if args.step != -1 else 'default',
+            "Batch Size": args.batch_size,
+            "Ensemble Size": args.ensemble_size,
+            "Image Size": args.image_size,
+        }
+
+        # Check each line for consistency with the current args
+        for line in existing_config.strip().splitlines():
+            key, value = line.split(": ", 1)
+            expected_value = str(existing_values.get(key.strip()))
+
+            # Raise an error if there's a mismatch
+            assert value.strip() == expected_value, (
+                f"Configuration mismatch in '{config_summary_path}' for '{key}': "
+                f"expected '{expected_value}', found '{value.strip()}'. Please verify the output directory."
+            )
+
+        print("Existing configuration matches current parameters.")
+
+    # If no config file exists, save the current configuration
+    else:
+        os.makedirs(os.path.dirname(config_summary_path), exist_ok=True)
+        with open(config_summary_path, 'w') as config_file:
+            config_file.write(f"Model Path: {args.model_path}\n")
+            config_file.write(f"CFG Scale: {args.cfg_scale}\n")
+            config_file.write(f"Sampling Algorithm: {args.sampling_algo}\n")
+            config_file.write(f"Steps: {args.step if args.step != -1 else 'default'}\n")
+            config_file.write(f"Batch Size: {args.batch_size}\n")
+            config_file.write(f"Ensemble Size: {args.ensemble_size}\n")
+            config_file.write(f"Image Size: {args.image_size}\n")
+        print(f"Inference configuration saved to {config_summary_path}")
+
+
 if __name__ == '__main__':
     args = get_args()
 
     # Setup PyTorch environment
     set_env(args.seed)
+    # Save inference configuration summary to output_dir
+    check_and_save_config_summary(args)
 
     # Determine device and data type
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -427,6 +487,7 @@ if __name__ == '__main__':
 
     # Process images and save the generated outputs
     process_image(args)
+    
 
 
 

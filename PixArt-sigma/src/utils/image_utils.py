@@ -3,6 +3,8 @@ import torch
 from PIL import Image
 import matplotlib
 from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import resize
+
 
 
 # Modified from Marigold: https://github.com/prs-eth/Marigold/blob/62413d56099d36573b2de1eb8c429839734b7782/src/trainer/marigold_trainer.py#L387

@@ -2,20 +2,20 @@ import os
 import torch
 from transformers import T5Tokenizer, T5EncoderModel
 
-def save_null_caption_embeddings(pipeline_path, accelerator, save_dir="output/null_embedding"):
+def save_null_caption_embeddings(pipeline_path, save_dir="output/null_embedding"):
     """Save the null caption token and its embeddings to .pt files."""
     os.makedirs(save_dir, exist_ok=True)
 
     max_sequence_length = 300
     tokenizer = T5Tokenizer.from_pretrained(pipeline_path, subfolder="tokenizer")
     text_encoder = T5EncoderModel.from_pretrained(
-        pipeline_path, subfolder="text_encoder", torch_dtype=torch.float16
-    ).to(accelerator.device)
+        pipeline_path, subfolder="text_encoder", torch_dtype=torch.float32
+    )
 
     null_caption_token = tokenizer(
         "", max_length=max_sequence_length, padding="max_length", 
         truncation=True, return_tensors="pt"
-    ).to(accelerator.device)
+    )
 
     null_caption_embs = text_encoder(
         null_caption_token.input_ids, 

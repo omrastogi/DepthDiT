@@ -19,7 +19,7 @@ dataset:
       dir: Hypersim/processed/train
       # filenames: data_split/hypersim/filename_list_train_filtered.txt 
       filenames: data_split/hypersim/filename_list_train_filtered_subset.txt # For overfitting
-      # resize_to_hw: [512, 512]
+      resize_to_hw: [512, 512]
     - name: vkitti
       disp_name: vkitti_train
       dir: vkitti2
@@ -27,7 +27,7 @@ dataset:
       filenames: data_split/vkitti/vkitti_train_subset.txt
       kitti_bm_crop: true
       valid_mask_crop: null
-      # resize_to_hw: [512, 512]
+      resize_to_hw: [512, 512]
 
   val:
       name: hypersim
@@ -57,8 +57,8 @@ paths:
 
 dataloader:
   num_workers: 1
-  effective_batch_size: 2 # Needed for grad accumulation
-  max_train_batch_size: 10 # Hence not using these values
+  effective_batch_size: 8 # Needed for grad accumulation
+  # max_train_batch_size: 10 # Hence not using these values
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 validation:

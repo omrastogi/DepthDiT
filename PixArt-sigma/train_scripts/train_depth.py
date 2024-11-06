@@ -7,8 +7,11 @@ import time
 import types
 import warnings
 from pathlib import Path
+from tqdm import tqdm
 import wandb
+from copy import deepcopy
 from omegaconf import OmegaConf
+from collections import OrderedDict
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
 
@@ -40,8 +43,10 @@ from diffusion.utils.optimizer import build_optimizer, auto_scale_lr
 from src.dataset import BaseDepthDataset, DatasetMode, get_dataset
 from src.dataset.depth_transform import get_depth_normalizer
 from src.dataset.dist_mixed_sampler import DistributedMixedBatchSampler
+from src.dataset.mixed_sampler import MixedBatchSampler
 from src.dataset.hypersim_dataset import HypersimDataset
-from src.utils.image_utils import decode_depth, colorize_depth_maps, chw2hwc
+from src.utils.image_utils import decode_depth, colorize_depth_maps, chw2hwc, encode_depth
+from src.utils.embedding_utils import load_null_caption_embeddings, save_null_caption_embeddings
 warnings.filterwarnings("ignore")  # ignore warning
 
 
@@ -51,21 +56,44 @@ def set_fsdp_env():
     os.environ["FSDP_BACKWARD_PREFETCH"] = 'BACKWARD_PRE'
     os.environ["FSDP_TRANSFORMER_CLS_TO_WRAP"] = 'PixArtBlock'
 
-# Modified from Marigold: https://github.com/prs-eth/Marigold/blob/62413d56099d36573b2de1eb8c429839734b7782/src/trainer/marigold_trainer.py#L387
-def encode_depth(depth_in, vae):
-    # stack depth into 3-channel
-    stacked = stack_depth_images(depth_in)
-    # encode using VAE encoder
-    depth_latent = vae.encode(stacked).latent_dist.sample().mul_(vae.config.scaling_factor)
-    return depth_latent
+@torch.no_grad()
+def update_ema(ema_model, model, decay=0.9999):
+    """
+    Update the EMA model parameters using vectorized operations.
+    """
+    with torch.no_grad():
+        for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
+            ema_param.mul_(decay).add_(model_param, alpha=1 - decay)
 
-def stack_depth_images(depth_in):
-    if 4 == len(depth_in.shape):
-        stacked = depth_in.repeat(1, 3, 1, 1)
-    elif 3 == len(depth_in.shape):
-        stacked = depth_in.unsqueeze(1)
-        stacked = depth_in.repeat(1, 3, 1, 1)
-    return stacked
+
+# def update_ema(ema_model, model, decay=0.9999):
+#     """
+#     Step the EMA model towards the current model.
+#     """
+#     import time
+
+#     start_time = time.time()
+#     ema_params = OrderedDict(ema_model.named_parameters())
+#     model_params = OrderedDict(model.named_parameters())
+
+#     for name, param in model_params.items():
+#         # Remove 'module.' prefix if present
+#         name_in_ema = name.replace('module.', '')
+#         if name_in_ema in ema_params:
+#             ema_param = ema_params[name_in_ema]
+#             ema_param.mul_(decay).add_(param.data, alpha=1 - decay)
+#         else:
+#             print(f"Parameter {name_in_ema} not found in EMA model.")
+
+#     end_time = time.time()
+#     print(f"EMA update took {end_time - start_time} seconds")
+
+def requires_grad(model, flag=True):
+    """
+    Set requires_grad flag for all parameters in a model.
+    """
+    for p in model.parameters():
+        p.requires_grad = flag
 
 def _replace_patchembed_proj(model):
     """Replace the first layer to accept 8 in_channels."""
@@ -130,14 +158,14 @@ def log_validation(model, loader, vae, device, step):
             model.forward_with_dpmsolver,
             condition=caption_embs,
             uncondition=null_y,
-            cfg_scale=4.5,
+            cfg_scale=3.0,
             model_kwargs=model_kwargs
         )
 
         # Generate samples
         samples = dpm_solver.sample(
             z,
-            steps=14,
+            steps=25,
             order=2,
             skip_type="time_uniform",
             method="multistep",
@@ -186,8 +214,6 @@ def create_datasets(cfg, rank, world_size):
     else:
         loader_generator = torch.Generator().manual_seed(loader_seed)
 
-    # cfg = config_dataset
-
     # Training dataset
     depth_transform = get_depth_normalizer(
         cfg_normalizer=cfg.depth_normalization
@@ -208,14 +234,22 @@ def create_datasets(cfg, rank, world_size):
         ), "Lengths don't match: `prob_ls` and `dataset_list`"
         concat_dataset = ConcatDataset(dataset_ls)
 
-        sampler = DistributedMixedBatchSampler(
+        # sampler = DistributedMixedBatchSampler(
+        #     src_dataset_ls=dataset_ls,
+        #     batch_size=cfg.dataloader.effective_batch_size,
+        #     drop_last=True,
+        #     shuffle=True,
+        #     world_size=world_size,
+        #     rank=rank,
+        #     prob=cfg.dataset.train.prob_ls,
+        #     generator=loader_generator,
+        # )
+        sampler = MixedBatchSampler(
             src_dataset_ls=dataset_ls,
             batch_size=cfg.dataloader.effective_batch_size,
             drop_last=True,
-            shuffle=True,
-            world_size=world_size,
-            rank=rank,
             prob=cfg.dataset.train.prob_ls,
+            shuffle=True,
             generator=loader_generator,
         )
 
@@ -243,10 +277,10 @@ def create_datasets(cfg, rank, world_size):
         )
 
     val_dataset = HypersimDataset(
-        mode=DatasetMode.EVAL,  # Since TRAIN changes the shape
+        mode=DatasetMode.TRAIN,  # Since TRAIN changes the shape
         filename_ls_path=cfg.dataset.val.filenames,
         dataset_dir=os.path.join(cfg.paths.base_data_dir, cfg.dataset.val.dir),
-        # resize_to_hw=cfg.dataset.val.resize_to_hw,
+        resize_to_hw=cfg.dataset.val.resize_to_hw if 'resize_to_hw' in cfg.dataset.val else None,
         disp_name=cfg.dataset.val.name,
         depth_transform=depth_transform
     )
@@ -260,135 +294,144 @@ def create_datasets(cfg, rank, world_size):
     )
     return train_loader, val_loader
 
+
 def train():
     if config.get('debug_nan', False):
         DebugUnderflowOverflow(model)
-        logger.info('NaN debugger registered. Start to detect overflow during training.')
+        logger.info('NaN debugger registered. Start detecting overflow during training.')
+
+    if accelerator.sync_gradients:
+        update_ema(ema, model, decay=0)  # Initialize EMA
+        ema.eval()
+
     time_start, last_tic = time.time(), time.time()
     log_buffer = LogBuffer()
-
+    
     global_step = start_step + 1
-    if args.report_to == "wandb":
+    total_iterations = config.num_epochs * len(train_dataloader)  # Calculate total iterations
+    epoch = 0
+
+    # Initialize tracking (e.g., WandB)
+    if accelerator.is_main_process and args.report_to == "wandb":
         wandb.init(project=args.tracker_project_name, config=config)
         accelerator.init_trackers(args.tracker_project_name, config)
+
+    data_time_start = time.time()
+    data_time_all = 0
+
+    # Iteration-based training loop
+    for step in tqdm(range(global_step, total_iterations + 1), initial=global_step, total=total_iterations, desc="Training Progress"):
+        grad_norm = None
+        if step % len(train_dataloader) == 0 or step==1:
+            epoch += 1
+            # train_dataloader.sampler.set_epoch(epoch)
+            train_loader_iter = iter(train_dataloader)
         
-    # Now you train the model
-    for epoch in range(start_epoch + 1, config.num_epochs + 1):
-        data_time_start= time.time()
-        data_time_all = 0
-        for step, batch in enumerate(train_dataloader):
-            # print(batch["rgb_relative_path"])
-            # print(torch.cuda.memory_summary())
-            if step < skip_step:
-                global_step += 1
-                continue    # skip data in the resumed ckpt
+        batch = next(train_loader_iter)  # Sample the next batch
+        # print(batch["rgb_relative_path"])
+        rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=torch.float16)
+        depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=torch.float16)
 
-            # if self.args.valid_mask_loss: #TODO add valid mask later p -2
-            #     valid_mask_for_latent = batch['valid_mask_raw'].to(self.device)
-            #     invalid_mask = ~valid_mask_for_latent
-            #     valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
-            # else:
-            #     valid_mask_down = None
+        # Encode inputs
+        rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(config.scale_factor)
+        depth_gt_latent = encode_depth(depth_gt_for_latent, vae)
 
-            rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=torch.float16)
-            depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=torch.float16)
+        del rgb, depth_gt_for_latent
+        torch.cuda.empty_cache()
 
-            #TODO experiment with vae.encode(rgb).latent_dist.mode() p
-            #TODO Also need to see if there need to be a different scaling factor
-            rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(config.scale_factor)
-            depth_gt_latent = encode_depth(depth_gt_for_latent, vae)
+        bs = rgb_input_latent.shape[0]
+        y = null_caption_embs.unsqueeze(0).repeat(bs, 1, 1, 1).detach()
+        timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=accelerator.device).long()
 
-            del rgb, depth_gt_for_latent
-            torch.cuda.empty_cache()
+        data_time_all += time.time() - data_time_start
 
-            """
-            data_info = {'img_hw': tensor([[1024., 1024.], [1024., 1024.]], device='cuda:0'), 'aspect_ratio': tensor([1., 1.], device='cuda:0', dtype=torch.float64), 'mask_type': ['null', 'null']
-            """
-
-            bs = rgb_input_latent.shape[0]
-
-            y = null_caption_embs.unsqueeze(0).repeat(bs, 1, 1, 1).detach()
-            # Sample a random timestep for each image
-            # bs = rgb_input_latent.shape[0]
-            timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=accelerator.device).long()
-            grad_norm = None
-            data_time_all += time.time() - data_time_start
-            with accelerator.accumulate(model):
-                optimizer.zero_grad()  # Make sure gradients are cleared only once
-                loss_term = train_diffusion.training_losses(
-                    model, 
-                    depth_gt_latent, 
-                    timesteps, 
-                    model_kwargs=dict(
-                        y=y, 
-                        mask=None,
-                        input_latent=rgb_input_latent
-                    )
+        # Training step
+        with accelerator.accumulate(model):
+            optimizer.zero_grad()
+            loss_term = train_diffusion.training_losses(
+                model, 
+                depth_gt_latent, 
+                timesteps, 
+                model_kwargs=dict(
+                    y=y, 
+                    mask=None,
+                    input_latent=rgb_input_latent
                 )
-                loss = loss_term['loss'].mean()
-                accelerator.backward(loss)  # Should only be called once per step
-                if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
-                optimizer.step()
-                lr_scheduler.step()
+            )
+            loss = loss_term['loss'].mean()
+            accelerator.backward(loss)
+            
+            if accelerator.sync_gradients:
+                grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            optimizer.step()
+            update_ema(ema, model.module)
+            # lr_scheduler.step()
 
-            lr = lr_scheduler.get_last_lr()[0]
-            logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
-            if grad_norm is not None:
-                logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
-            log_buffer.update(logs)
-            if (step + 1) % config.log_interval == 0 or (step + 1) == 1:
-                t = (time.time() - last_tic) / config.log_interval
-                t_d = data_time_all / config.log_interval
-                avg_time = (time.time() - time_start) / (global_step + 1)
-                eta = str(datetime.timedelta(seconds=int(avg_time * (total_steps - global_step - 1))))
-                eta_epoch = str(datetime.timedelta(seconds=int(avg_time * (len(train_dataloader) - step - 1))))
-                log_buffer.average()
+        # Logging
+        # lr = lr_scheduler.get_last_lr()[0]
+        logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
+        log_buffer.update(logs)
 
-                info = f"Step/Epoch [{global_step}/{epoch}][{step + 1}/{len(train_dataloader)}]:total_eta: {eta}, " \
-                    f"epoch_eta:{eta_epoch}, time_all:{t:.3f}, time_data:{t_d:.3f}, lr:{lr:.3e}, "
-                info += f's:({model.module.h}, {model.module.w}), ' if hasattr(model, 'module') else f's:({model.h}, {model.w}), '
+        if step % config.log_interval == 0:
+            avg_time = (time.time() - time_start) / step
+            eta = str(datetime.timedelta(seconds=int(avg_time * (total_iterations - step))))
+            t_d = data_time_all / config.log_interval
 
-                info += ', '.join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
-                logger.info(info)
-                last_tic = time.time()
-                log_buffer.clear()
-                data_time_all = 0
-            logs.update(lr=lr)
-            accelerator.log(logs, step=global_step)
+            info = f"Step [{step}/{total_iterations}] ETA: {eta}, " \
+                   f"Time Data: {t_d:.3f}, LR: {optimizer.defaults['lr']:.3e}, "
+            info += ', '.join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
+            logger.info(info)
 
-            global_step += 1
-            data_time_start = time.time()
-            del rgb_input_latent, depth_gt_latent, timesteps
-            flush()
-            if config.save_model_steps and global_step % config.save_model_steps == 0:
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    os.umask(0o000)
-                    save_checkpoint(os.path.join(config.work_dir, 'checkpoints'),
-                                    epoch=epoch,
-                                    step=global_step,
-                                    model=accelerator.unwrap_model(model),
-                                    optimizer=optimizer,
-                                    lr_scheduler=lr_scheduler
-                                    )
-            if config.visualize and (global_step % config.eval_sampling_steps == 0 or (step + 1) == 1):
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    log_validation(model, val_loader, vae, accelerator.device, global_step)
+            last_tic = time.time()
+            log_buffer.clear()
+            data_time_all = 0
+            
+        if grad_norm is not None:
+            logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
 
-        if epoch % config.save_model_epochs == 0 or epoch == config.num_epochs:
+        # Log to tracking tool (e.g., WandB)
+        if accelerator.is_main_process:
+            # logs.update(lr=lr)
+            accelerator.log(logs, step=step)
+
+
+        # Save checkpoint periodically
+        if config.save_model_steps and step % config.save_model_steps == 0:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
-                os.umask(0o000)
-                save_checkpoint(os.path.join(config.work_dir, 'checkpoints'),
-                                epoch=epoch,
-                                step=global_step,
-                                model=accelerator.unwrap_model(model),
-                                optimizer=optimizer,
-                                lr_scheduler=lr_scheduler
-                                )
-        accelerator.wait_for_everyone()
+                save_checkpoint(
+                    os.path.join(config.work_dir, 'checkpoints'),
+                    epoch=step // len(train_dataloader),  # Optional: calculate current epoch
+                    step=step,
+                    model=accelerator.unwrap_model(model),
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler
+                )
+
+        # Validation and visualization (optional)
+        if config.visualize and step % config.eval_sampling_steps == 0 or step==0:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                log_validation(model, val_loader, vae, accelerator.device, step)
+
+        # Final checkpoint after all iterations
+        if step == total_iterations:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                save_checkpoint(
+                    os.path.join(config.work_dir, 'checkpoints'),
+                    epoch=config.num_epochs,
+                    step=step,
+                    model=accelerator.unwrap_model(model),
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler
+                )
+
+        # Prepare for next iteration
+        global_step += 1
+        data_time_start = time.time()
+        del rgb_input_latent, depth_gt_latent, timesteps
+        flush()
 
 
 def parse_args():
@@ -401,8 +444,9 @@ def parse_args():
     parser.add_argument('--local-rank', type=int, default=-1)
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--is_depth', action='store_true')
     parser.add_argument(
-        "--pipeline_load_from", default='output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
+        "--pipeline_load_from", default='/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
         type=str, help="Download for loading text_encoder, "
                        "tokenizer and vae from https://huggingface.co/PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers"
     )
@@ -485,14 +529,6 @@ if __name__ == '__main__':
     config.seed = init_random_seed(config.get('seed', None))
     set_random_seed(config.seed)
 
-    # if accelerator.is_main_process:
-    #     config.dump(os.path.join(config.work_dir, 'config.py'))
-
-    # if accelerator.is_main_process:
-    #     with open(os.path.join(config.work_dir, 'config.py'), 'w') as f:
-    #         f.write(OmegaConf.to_yaml(config))
-
-    # logger.info(f"Config: \n{config.pretty_text}")
     world_size = get_world_size()
     rank = get_rank()
 
@@ -517,16 +553,14 @@ if __name__ == '__main__':
                     "kv_compress_config": kv_compress_config, "micro_condition": config.micro_condition}
     
 
-    max_sequence_length = 300
-    tokenizer = T5Tokenizer.from_pretrained(args.pipeline_load_from, subfolder="tokenizer")
-    text_encoder = T5EncoderModel.from_pretrained(
-        args.pipeline_load_from, subfolder="text_encoder", torch_dtype=torch.float16).to(accelerator.device)
+    # Check if the .pt files exist, otherwise save them
+    save_dir = "output/null_embedding"
+    if not (os.path.exists(os.path.join(save_dir, "null_caption_token.pt")) and
+            os.path.exists(os.path.join(save_dir, "null_caption_embs.pt"))):
+        save_null_caption_embeddings(args.pipeline_load_from, accelerator)
 
-    null_caption_token = tokenizer("", max_length=max_sequence_length, padding="max_length", truncation=True, return_tensors="pt").to(accelerator.device)
-    null_caption_embs = text_encoder(null_caption_token.input_ids, attention_mask=null_caption_token.attention_mask)[0]
-    del tokenizer, text_encoder
-    flush()
-
+    # Load the saved embeddings and tokens
+    null_caption_token, null_caption_embs = load_null_caption_embeddings(save_dir)
 
     # build models
     train_diffusion = IDDPM(str(config.train_sampling_steps), learn_sigma=learn_sigma, pred_sigma=pred_sigma, snr=config.snr_loss)
@@ -538,17 +572,34 @@ if __name__ == '__main__':
                         pred_sigma=pred_sigma,
                         **model_kwargs).train()
     logger.info(f"{model.__class__.__name__} Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
     if args.load_from is not None:
         config.load_from = args.load_from
-    if config.load_from is not None:
-        missing, unexpected = load_checkpoint(
-            config.load_from, model, load_ema=config.get('load_ema', False), max_length=max_length)
-        logger.warning(f'Missing keys: {missing}')
-        logger.warning(f'Unexpected keys: {unexpected}')
-    
-    model = _replace_patchembed_proj(model)
-    #TODO: Add the replacement code here- 1
 
+    def load_model():
+        if config.load_from is not None:
+            missing, unexpected = load_checkpoint(
+                config.load_from, model, load_ema=config.get('load_ema', False), max_length=max_length)
+            logger.warning(f'Missing keys: {missing}')
+            logger.warning(f'Unexpected keys: {unexpected}')
+
+
+    if args.is_depth:
+        # For Depth DiT model
+        # The state_dict is already modified for depth, so modify the model before loading
+        model = _replace_patchembed_proj(model)
+        load_model()
+    else:
+        # For a vanilla DiT model
+        # Load the state_dict first, and then modify the model afterwards
+        load_model()
+        model = _replace_patchembed_proj(model)
+    
+    ema = deepcopy(model).to(accelerator.device)  # EMA model
+    requires_grad(ema, False)
+
+    # model = _replace_patchembed_proj(model)
+    
     # prepare for FSDP clip grad norm calculation
     if accelerator.distributed_type == DistributedType.FSDP:
         for m in accelerator._models:
@@ -556,16 +607,21 @@ if __name__ == '__main__':
 
     # build dataloader
     train_dataloader, val_loader = create_datasets(config.conf_data, rank, world_size)
-
-
-    lr_scale_ratio = 1
-    if config.get('auto_lr', None):
-        lr_scale_ratio = auto_scale_lr(config.train_batch_size * get_world_size() * config.gradient_accumulation_steps,
-                                       config.optimizer, **config.auto_lr)
-    optimizer = build_optimizer(model, config.optimizer)
-    lr_scheduler = build_lr_scheduler(config, optimizer, train_dataloader, lr_scale_ratio)
-
+    logger.info(f"Number of training samples: {len(train_dataloader.dataset)}")
+    logger.info(f"Total number of batches: {len(train_dataloader)}")
+    logger.info(f"Batch size: {train_dataloader.batch_size}")
     timestamp = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
+
+    # optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.optimizer["lr"], weight_decay=config.optimizer["weight_decay"])
+
+    # lr_scale_ratio = 1
+    # if config.get('auto_lr', None):
+    #     lr_scale_ratio = auto_scale_lr(config.train_batch_size * get_world_size() * config.gradient_accumulation_steps,
+    #                                    config.optimizer, **config.auto_lr)    
+    # lr_scheduler = build_lr_scheduler(config, optimizer, train_dataloader, lr_scale_ratio)
+
+    lr_scheduler = None
 
     if accelerator.is_main_process:
         tracker_config = dict(vars(config))
@@ -596,16 +652,17 @@ if __name__ == '__main__':
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
     # objects in the same order you gave them to the prepare method.
+
     model = accelerator.prepare(model)
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
     train()
 
 """
-python -m torch.distributed.launch --nproc_per_node=1 --master_port=12345 \
+python -m torch.distributed.launch --nproc_per_node=2 --master_port=12345 \
           train_scripts/train_depth.py \
           configs/pixart_sigma_config/PixArt_sigma_xl2_img512_depth.py \
-          --load-from output/pretrained_models/PixArt-Sigma-XL-2-512-MS.pth \
-          --work-dir output/your_first_pixart-exp \
+          --load-from /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/PixArt-Sigma-XL-2-1024-MS.pth \
+          --work-dir output/depth_512_mixed_training \
           --debug \
           --report_to wandb
 """

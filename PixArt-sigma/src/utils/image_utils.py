@@ -3,6 +3,24 @@ import torch
 from PIL import Image
 import matplotlib
 
+
+# Modified from Marigold: https://github.com/prs-eth/Marigold/blob/62413d56099d36573b2de1eb8c429839734b7782/src/trainer/marigold_trainer.py#L387
+def encode_depth(depth_in, vae):
+    # stack depth into 3-channel
+    stacked = stack_depth_images(depth_in)
+    # encode using VAE encoder
+    depth_latent = vae.encode(stacked).latent_dist.sample().mul_(vae.config.scaling_factor)
+    return depth_latent
+
+def stack_depth_images(depth_in):
+    if 4 == len(depth_in.shape):
+        stacked = depth_in.repeat(1, 3, 1, 1)
+    elif 3 == len(depth_in.shape):
+        stacked = depth_in.unsqueeze(1)
+        stacked = depth_in.repeat(1, 3, 1, 1)
+    return stacked
+
+
 def decode_depth(depth_latent, vae):
     """Decode depth latent into depth map"""
     # scale latent

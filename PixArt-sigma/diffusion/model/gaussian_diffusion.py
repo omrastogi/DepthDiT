@@ -741,7 +741,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, timestep, model_kwargs=None, noise=None, skip_noise=False):
+    def training_losses(self, model, x_start, timestep, model_kwargs=None, noise=None, skip_noise=False, valid_mask=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -764,7 +764,6 @@ class GaussianDiffusion:
             x_t = self.q_sample(x_start, t, noise=noise)
 
         terms = {}
-
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
@@ -832,7 +831,12 @@ class GaussianDiffusion:
                 # best
                 target = th.where(t > 249, noise, x_start)
                 output = th.where(t > 249, pred_noise, pred_startx)
-            loss = (target - output) ** 2
+            # loss = (target - output) ** 2
+            if valid_mask is None:
+                loss = (target - output) ** 2
+            else:
+                loss = (target[valid_mask] - output[valid_mask]) ** 2
+
             if model_kwargs.get('mask_ratio', False) and model_kwargs['mask_ratio'] > 0:
                 assert 'mask' in model_output
                 loss = F.avg_pool2d(loss.mean(dim=1), model.model.module.patch_size).flatten(1)

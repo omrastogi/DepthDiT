@@ -210,7 +210,8 @@ def log_validation(model, loader, vae, device, step):
 
 def create_datasets(cfg, rank, world_size):
     loader_seed = 0
-    num_workers = 4
+    num_workers = cfg.dataloader.num_workers
+    print("num_workers:", num_workers)
     if loader_seed is None:
         loader_generator = None
     else:
@@ -236,16 +237,6 @@ def create_datasets(cfg, rank, world_size):
         ), "Lengths don't match: `prob_ls` and `dataset_list`"
         concat_dataset = ConcatDataset(dataset_ls)
 
-        # sampler = DistributedMixedBatchSampler(
-        #     src_dataset_ls=dataset_ls,
-        #     batch_size=cfg.dataloader.effective_batch_size,
-        #     drop_last=True,
-        #     shuffle=True,
-        #     world_size=world_size,
-        #     rank=rank,
-        #     prob=cfg.dataset.train.prob_ls,
-        #     generator=loader_generator,
-        # )
         sampler = MixedBatchSampler(
             src_dataset_ls=dataset_ls,
             batch_size=cfg.dataloader.effective_batch_size,
@@ -259,6 +250,7 @@ def create_datasets(cfg, rank, world_size):
             concat_dataset,
             batch_sampler=sampler,
             num_workers=num_workers,
+            pin_memory=True
         )
     else:
         sampler = DistributedSampler(
@@ -276,6 +268,7 @@ def create_datasets(cfg, rank, world_size):
             num_workers=num_workers,
             shuffle=True,
             generator=loader_generator,
+            pin_memory=True
         )
 
     val_dataset = HypersimDataset(
@@ -320,6 +313,16 @@ def train():
 
     data_time_start = time.time()
     data_time_all = 0
+
+    # TODO - FURTHER EXPERIMENT TO CHECK IF LR SCHEDULER CAN WORK
+    # from transformers import get_linear_schedule_with_warmup
+    # warmup_steps = 500
+    # scheduler = get_linear_schedule_with_warmup(
+    # optimizer, 
+    # num_warmup_steps=warmup_steps, 
+    # num_training_steps=total_iterations
+    # )
+
 
     # Iteration-based training loop
     for step in tqdm(range(global_step, total_iterations + 1), initial=global_step, total=total_iterations, desc="Training Progress"):
@@ -391,6 +394,7 @@ def train():
             if accelerator.sync_gradients:
                 grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
             optimizer.step()
+            # scheduler.step()
             update_ema(ema, model)
             # lr_scheduler.step()
 
@@ -405,10 +409,10 @@ def train():
             t_d = data_time_all / config.log_interval
 
             info = f"Step [{step}/{total_iterations}] ETA: {eta}, " \
-                   f"Time Data: {t_d:.3f}, LR: {optimizer.defaults['lr']:.3e}, "
+                   f"Time Data: {t_d:.3f}, LR: {optimizer.param_groups[0]['lr']:.3e}, "
             info += ', '.join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
             logger.info(info)
-
+            # logs.update(lr=scheduler.get_last_lr()[0])
             last_tic = time.time()
             log_buffer.clear()
             data_time_all = 0
@@ -473,7 +477,7 @@ def parse_args():
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--is_depth', action='store_true')
     parser.add_argument(
-        "--pipeline_load_from", default='/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
+        "--pipeline_load_from", default='output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
         type=str, help="Download for loading text_encoder, "
                        "tokenizer and vae from https://huggingface.co/PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers"
     )
@@ -581,10 +585,10 @@ if __name__ == '__main__':
     
 
     # Check if the .pt files exist, otherwise save them
-    save_dir = "output/null_embedding"
+    save_dir = f"output/null_embedding/{max_length}"
     if not (os.path.exists(os.path.join(save_dir, "null_caption_token.pt")) and
             os.path.exists(os.path.join(save_dir, "null_caption_embs.pt"))):
-        save_null_caption_embeddings(args.pipeline_load_from, accelerator)
+        save_null_caption_embeddings(args.pipeline_load_from, max_length, accelerator.device,save_dir)
 
     # Load the saved embeddings and tokens
     null_caption_token, null_caption_embs = load_null_caption_embeddings(save_dir)

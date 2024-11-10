@@ -210,8 +210,11 @@ def log_validation(model, loader, vae, device, step):
 
 def create_datasets(cfg, rank, world_size):
     loader_seed = 0
-    num_workers = cfg.dataloader.num_workers
-    print("num_workers:", num_workers)
+    num_workers = cfg.num_workers
+    batch_size = cfg.train_batch_size
+    val_batch_size = cfg.val_batch_size
+    cfg = cfg.conf_data
+
     if loader_seed is None:
         loader_generator = None
     else:
@@ -239,7 +242,7 @@ def create_datasets(cfg, rank, world_size):
 
         sampler = MixedBatchSampler(
             src_dataset_ls=dataset_ls,
-            batch_size=cfg.dataloader.effective_batch_size,
+            batch_size=batch_size,
             drop_last=True,
             prob=cfg.dataset.train.prob_ls,
             shuffle=True,
@@ -264,7 +267,7 @@ def create_datasets(cfg, rank, world_size):
         train_loader = DataLoader(
             dataset=train_dataset,
             sampler=sampler,
-            batch_size=cfg.dataloader.effective_batch_size,
+            batch_size=val_batch_size,
             num_workers=num_workers,
             shuffle=True,
             generator=loader_generator,
@@ -303,7 +306,11 @@ def train():
     log_buffer = LogBuffer()
     
     global_step = start_step + 1
-    total_iterations = config.num_epochs * len(train_dataloader)  # Calculate total iterations
+    if hasattr(config, 'num_iterations'):
+        total_iterations = config.num_iterations
+    else:
+        total_iterations = config.num_epochs * len(train_dataloader)  # Calculate total iterations
+
     epoch = 0
 
     # Initialize tracking (e.g., WandB)
@@ -315,14 +322,21 @@ def train():
     data_time_all = 0
 
     # TODO - FURTHER EXPERIMENT TO CHECK IF LR SCHEDULER CAN WORK
-    # from transformers import get_linear_schedule_with_warmup
-    # warmup_steps = 500
-    # scheduler = get_linear_schedule_with_warmup(
-    # optimizer, 
-    # num_warmup_steps=warmup_steps, 
-    # num_training_steps=total_iterations
-    # )
-
+    from torch.optim.lr_scheduler import LambdaLR
+    def linear_decay_lr_schedule(current_step, start_step, total_steps):
+        if current_step < start_step:
+            return 1.0  # Keep the learning rate at the base_lr
+        elif current_step >= total_steps:
+            return 0.0  # Fully decay to zero after total_steps
+        else:
+            # Linearly decay the learning rate
+            decay_steps = total_steps - start_step
+            return 1.0 - (current_step - start_step) / decay_steps
+        
+    lr_scheduler = LambdaLR(
+    optimizer,
+    lr_lambda=lambda step: linear_decay_lr_schedule(step, start_step=0, total_steps=total_iterations),
+    )
 
     # Iteration-based training loop
     for step in tqdm(range(global_step, total_iterations + 1), initial=global_step, total=total_iterations, desc="Training Progress"):
@@ -394,12 +408,11 @@ def train():
             if accelerator.sync_gradients:
                 grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
             optimizer.step()
-            # scheduler.step()
             update_ema(ema, model)
-            # lr_scheduler.step()
+            lr_scheduler.step()
 
         # Logging
-        # lr = lr_scheduler.get_last_lr()[0]
+        lr = lr_scheduler.get_last_lr()[0]
         logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
         log_buffer.update(logs)
 
@@ -409,10 +422,17 @@ def train():
             t_d = data_time_all / config.log_interval
 
             info = f"Step [{step}/{total_iterations}] ETA: {eta}, " \
-                   f"Time Data: {t_d:.3f}, LR: {optimizer.param_groups[0]['lr']:.3e}, "
+                   f"Time Data: {t_d:.3f}, LR: {lr:.4e}, "
             info += ', '.join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
             logger.info(info)
-            # logs.update(lr=scheduler.get_last_lr()[0])
+            gradient_norms = {}
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm_internal = param.grad.data.norm(2).item()
+                    # Store the gradient norm with a prefix for WandB grouping
+                    gradient_norms[f'gradient_norm/{name}'] = grad_norm_internal
+            logs.update(gradient_norms)
+            logs.update(lr=lr)
             last_tic = time.time()
             log_buffer.clear()
             data_time_all = 0
@@ -518,7 +538,7 @@ if __name__ == '__main__':
             resume_lr_scheduler=True)
     if args.debug:
         config.log_interval = 1
-        config.train_batch_size = 2
+        config.train_batch_size = 1
 
     os.umask(0o000)
     os.makedirs(config.work_dir, exist_ok=True)
@@ -635,10 +655,12 @@ if __name__ == '__main__':
             m.clip_grad_norm_ = types.MethodType(clip_grad_norm_, m)
 
     # build dataloader
-    train_dataloader, val_loader = create_datasets(config.conf_data, rank, world_size)
+    train_dataloader, val_loader = create_datasets(config, rank, world_size)
     logger.info(f"Number of training samples: {len(train_dataloader.dataset)}")
     logger.info(f"Total number of batches: {len(train_dataloader)}")
-    logger.info(f"Batch size: {train_dataloader.batch_size}")
+    logger.info(f"Batch size per GPU: {config.train_batch_size}")
+    logger.info(f"Num Workers: {config.num_workers}")
+    logger.info(f"Effective Batch size: {config.train_batch_size * world_size * config.gradient_accumulation_steps}")
     timestamp = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
 
     # optimizer

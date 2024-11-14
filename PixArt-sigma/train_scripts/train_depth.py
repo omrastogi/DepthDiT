@@ -1,22 +1,23 @@
-import argparse
-import datetime
 import gc
 import os
 import sys
+import math
 import time
 import types
-import warnings
-from pathlib import Path
-from tqdm import tqdm
 import wandb
+import warnings
+import argparse
+import datetime
+from tqdm import tqdm
+from pathlib import Path
 from copy import deepcopy
 from omegaconf import OmegaConf
 from collections import OrderedDict
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
 
-import numpy as np
 import torch
+import numpy as np
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import DistributedType
 from diffusers.models import AutoencoderKL
@@ -24,6 +25,7 @@ from transformers import T5EncoderModel, T5Tokenizer
 from mmcv.runner import LogBuffer
 from PIL import Image
 from torch.utils.data import RandomSampler
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn import Conv2d
@@ -67,29 +69,6 @@ def update_ema(ema_model, model, decay=0.9999):
         for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
             ema_param.mul_(decay).add_(model_param, alpha=1 - decay)
 
-
-# def update_ema(ema_model, model, decay=0.9999):
-#     """
-#     Step the EMA model towards the current model.
-#     """
-#     import time
-
-#     start_time = time.time()
-#     ema_params = OrderedDict(ema_model.named_parameters())
-#     model_params = OrderedDict(model.named_parameters())
-
-#     for name, param in model_params.items():
-#         # Remove 'module.' prefix if present
-#         name_in_ema = name.replace('module.', '')
-#         if name_in_ema in ema_params:
-#             ema_param = ema_params[name_in_ema]
-#             ema_param.mul_(decay).add_(param.data, alpha=1 - decay)
-#         else:
-#             print(f"Parameter {name_in_ema} not found in EMA model.")
-
-#     end_time = time.time()
-#     print(f"EMA update took {end_time - start_time} seconds")
-
 def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
@@ -115,6 +94,28 @@ def _replace_patchembed_proj(model):
     model.x_embedder.proj = _new_proj
     print("PatchEmbed projection layer has been replaced.")
     return model
+
+def linear_decay_lr_schedule(current_step, start_step, total_steps):
+    if current_step < start_step:
+        return 1.0  # Keep the learning rate at the base_lr
+    elif current_step >= total_steps:
+        return 0.0  # Fully decay to zero after total_steps
+    else:
+        # Linearly decay the learning rate
+        decay_steps = total_steps - start_step
+        return 1.0 - (current_step - start_step) / decay_steps
+    
+def cosine_annealing_lr_schedule(current_step, start_step, total_steps):
+    if current_step < start_step:
+        return 1.0  # Keep the learning rate at the base_lr
+    elif current_step >= total_steps:
+        return 0.0  # Fully decay to zero after total_steps
+    else:
+        # Cosine annealing for the learning rate
+        decay_steps = total_steps - start_step
+        progress = (current_step - start_step) / decay_steps
+        return 0.5 * (1 + math.cos(math.pi * progress))  # Cosine annealing
+
 
 @torch.inference_mode()
 def log_validation(model, loader, vae, device, step):
@@ -320,23 +321,20 @@ def train():
 
     data_time_start = time.time()
     data_time_all = 0
+    
+    if config.lr_scheduler:
+        if config.cosine_annealing:
+            print("cosine annealing")
+            lr_scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: cosine_annealing_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
+            )
 
-    # TODO - FURTHER EXPERIMENT TO CHECK IF LR SCHEDULER CAN WORK
-    from torch.optim.lr_scheduler import LambdaLR
-    def linear_decay_lr_schedule(current_step, start_step, total_steps):
-        if current_step < start_step:
-            return 1.0  # Keep the learning rate at the base_lr
-        elif current_step >= total_steps:
-            return 0.0  # Fully decay to zero after total_steps
         else:
-            # Linearly decay the learning rate
-            decay_steps = total_steps - start_step
-            return 1.0 - (current_step - start_step) / decay_steps
-        
-    lr_scheduler = LambdaLR(
-    optimizer,
-    lr_lambda=lambda step: linear_decay_lr_schedule(step, start_step=0, total_steps=total_iterations),
-    )
+            lr_scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: linear_decay_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
+            )
 
     # Iteration-based training loop
     for step in tqdm(range(global_step, total_iterations + 1), initial=global_step, total=total_iterations, desc="Training Progress"):

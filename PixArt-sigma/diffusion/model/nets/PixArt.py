@@ -142,13 +142,15 @@ class PixArt(nn.Module):
             print(f"kv compress config: {self.kv_compress_config}")
 
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, **kwargs):
+    def forward(self, x, timestep, y, mask=None, data_info=None, input_latent=None, **kwargs):
         """
         Forward pass of PixArt.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N, 1, 120, C) tensor of class labels
         """
+        if input_latent is not None:
+            x = torch.cat([input_latent, x], dim=1)
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
         y = y.to(self.dtype)
@@ -173,12 +175,15 @@ class PixArt(nn.Module):
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x
 
-    def forward_with_dpmsolver(self, x, timestep, y, mask=None, **kwargs):
+    def forward_with_dpmsolver(self, x, timestep, y, mask=None, input_latent=None, **kwargs):
         """
         dpm solver donnot need variance prediction
         """
+        if input_latent is not None:
+            input_latent = torch.cat([input_latent] * 2)
+
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        model_out = self.forward(x, timestep, y, mask)
+        model_out = self.forward(x, timestep, y, mask, input_latent=input_latent, **kwargs)
         return model_out.chunk(2, dim=1)[0]
 
     def forward_with_cfg(self, x, timestep, y, cfg_scale, mask=None, **kwargs):

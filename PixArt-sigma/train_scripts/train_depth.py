@@ -1,22 +1,23 @@
-import argparse
-import datetime
 import gc
 import os
 import sys
+import math
 import time
 import types
-import warnings
-from pathlib import Path
-from tqdm import tqdm
 import wandb
+import warnings
+import argparse
+import datetime
+from tqdm import tqdm
+from pathlib import Path
 from copy import deepcopy
 from omegaconf import OmegaConf
 from collections import OrderedDict
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
 
-import numpy as np
 import torch
+import numpy as np
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import DistributedType
 from diffusers.models import AutoencoderKL
@@ -24,6 +25,7 @@ from transformers import T5EncoderModel, T5Tokenizer
 from mmcv.runner import LogBuffer
 from PIL import Image
 from torch.utils.data import RandomSampler
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn import Conv2d
@@ -67,29 +69,6 @@ def update_ema(ema_model, model, decay=0.9999):
         for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
             ema_param.mul_(decay).add_(model_param, alpha=1 - decay)
 
-
-# def update_ema(ema_model, model, decay=0.9999):
-#     """
-#     Step the EMA model towards the current model.
-#     """
-#     import time
-
-#     start_time = time.time()
-#     ema_params = OrderedDict(ema_model.named_parameters())
-#     model_params = OrderedDict(model.named_parameters())
-
-#     for name, param in model_params.items():
-#         # Remove 'module.' prefix if present
-#         name_in_ema = name.replace('module.', '')
-#         if name_in_ema in ema_params:
-#             ema_param = ema_params[name_in_ema]
-#             ema_param.mul_(decay).add_(param.data, alpha=1 - decay)
-#         else:
-#             print(f"Parameter {name_in_ema} not found in EMA model.")
-
-#     end_time = time.time()
-#     print(f"EMA update took {end_time - start_time} seconds")
-
 def requires_grad(model, flag=True):
     """
     Set requires_grad flag for all parameters in a model.
@@ -115,6 +94,28 @@ def _replace_patchembed_proj(model):
     model.x_embedder.proj = _new_proj
     print("PatchEmbed projection layer has been replaced.")
     return model
+
+def linear_decay_lr_schedule(current_step, start_step, total_steps):
+    if current_step < start_step:
+        return 1.0  # Keep the learning rate at the base_lr
+    elif current_step >= total_steps:
+        return 0.0  # Fully decay to zero after total_steps
+    else:
+        # Linearly decay the learning rate
+        decay_steps = total_steps - start_step
+        return 1.0 - (current_step - start_step) / decay_steps
+    
+def cosine_annealing_lr_schedule(current_step, start_step, total_steps):
+    if current_step < start_step:
+        return 1.0  # Keep the learning rate at the base_lr
+    elif current_step >= total_steps:
+        return 0.0  # Fully decay to zero after total_steps
+    else:
+        # Cosine annealing for the learning rate
+        decay_steps = total_steps - start_step
+        progress = (current_step - start_step) / decay_steps
+        return 0.5 * (1 + math.cos(math.pi * progress))  # Cosine annealing
+
 
 @torch.inference_mode()
 def log_validation(model, loader, vae, device, step):
@@ -210,7 +211,11 @@ def log_validation(model, loader, vae, device, step):
 
 def create_datasets(cfg, rank, world_size):
     loader_seed = 0
-    num_workers = 4
+    num_workers = cfg.num_workers
+    batch_size = cfg.train_batch_size
+    val_batch_size = cfg.val_batch_size
+    cfg = cfg.conf_data
+
     if loader_seed is None:
         loader_generator = None
     else:
@@ -236,19 +241,9 @@ def create_datasets(cfg, rank, world_size):
         ), "Lengths don't match: `prob_ls` and `dataset_list`"
         concat_dataset = ConcatDataset(dataset_ls)
 
-        # sampler = DistributedMixedBatchSampler(
-        #     src_dataset_ls=dataset_ls,
-        #     batch_size=cfg.dataloader.effective_batch_size,
-        #     drop_last=True,
-        #     shuffle=True,
-        #     world_size=world_size,
-        #     rank=rank,
-        #     prob=cfg.dataset.train.prob_ls,
-        #     generator=loader_generator,
-        # )
         sampler = MixedBatchSampler(
             src_dataset_ls=dataset_ls,
-            batch_size=cfg.dataloader.effective_batch_size,
+            batch_size=batch_size,
             drop_last=True,
             prob=cfg.dataset.train.prob_ls,
             shuffle=True,
@@ -259,6 +254,7 @@ def create_datasets(cfg, rank, world_size):
             concat_dataset,
             batch_sampler=sampler,
             num_workers=num_workers,
+            pin_memory=True
         )
     else:
         sampler = DistributedSampler(
@@ -272,10 +268,11 @@ def create_datasets(cfg, rank, world_size):
         train_loader = DataLoader(
             dataset=train_dataset,
             sampler=sampler,
-            batch_size=cfg.dataloader.effective_batch_size,
+            batch_size=val_batch_size,
             num_workers=num_workers,
             shuffle=True,
             generator=loader_generator,
+            pin_memory=True
         )
 
     val_dataset = HypersimDataset(
@@ -310,7 +307,11 @@ def train():
     log_buffer = LogBuffer()
     
     global_step = start_step + 1
-    total_iterations = config.num_epochs * len(train_dataloader)  # Calculate total iterations
+    if hasattr(config, 'num_iterations'):
+        total_iterations = config.num_iterations
+    else:
+        total_iterations = config.num_epochs * len(train_dataloader)  # Calculate total iterations
+
     epoch = 0
 
     # Initialize tracking (e.g., WandB)
@@ -320,6 +321,20 @@ def train():
 
     data_time_start = time.time()
     data_time_all = 0
+    
+    if config.lr_scheduler:
+        if config.cosine_annealing:
+            print("cosine annealing")
+            lr_scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: cosine_annealing_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
+            )
+
+        else:
+            lr_scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: linear_decay_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
+            )
 
     # Iteration-based training loop
     for step in tqdm(range(global_step, total_iterations + 1), initial=global_step, total=total_iterations, desc="Training Progress"):
@@ -392,10 +407,10 @@ def train():
                 grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
             optimizer.step()
             update_ema(ema, model)
-            # lr_scheduler.step()
+            lr_scheduler.step()
 
         # Logging
-        # lr = lr_scheduler.get_last_lr()[0]
+        lr = lr_scheduler.get_last_lr()[0]
         logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
         log_buffer.update(logs)
 
@@ -405,10 +420,17 @@ def train():
             t_d = data_time_all / config.log_interval
 
             info = f"Step [{step}/{total_iterations}] ETA: {eta}, " \
-                   f"Time Data: {t_d:.3f}, LR: {optimizer.defaults['lr']:.3e}, "
+                   f"Time Data: {t_d:.3f}, LR: {lr:.4e}, "
             info += ', '.join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
             logger.info(info)
-
+            gradient_norms = {}
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm_internal = param.grad.data.norm(2).item()
+                    # Store the gradient norm with a prefix for WandB grouping
+                    gradient_norms[f'gradient_norm/{name}'] = grad_norm_internal
+            logs.update(gradient_norms)
+            logs.update(lr=lr)
             last_tic = time.time()
             log_buffer.clear()
             data_time_all = 0
@@ -473,7 +495,7 @@ def parse_args():
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--is_depth', action='store_true')
     parser.add_argument(
-        "--pipeline_load_from", default='/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/PixArt-sigma/output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
+        "--pipeline_load_from", default='output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
         type=str, help="Download for loading text_encoder, "
                        "tokenizer and vae from https://huggingface.co/PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers"
     )
@@ -514,7 +536,7 @@ if __name__ == '__main__':
             resume_lr_scheduler=True)
     if args.debug:
         config.log_interval = 1
-        config.train_batch_size = 2
+        config.train_batch_size = 1
 
     os.umask(0o000)
     os.makedirs(config.work_dir, exist_ok=True)
@@ -581,10 +603,10 @@ if __name__ == '__main__':
     
 
     # Check if the .pt files exist, otherwise save them
-    save_dir = "output/null_embedding"
+    save_dir = f"output/null_embedding/{max_length}"
     if not (os.path.exists(os.path.join(save_dir, "null_caption_token.pt")) and
             os.path.exists(os.path.join(save_dir, "null_caption_embs.pt"))):
-        save_null_caption_embeddings(args.pipeline_load_from, accelerator)
+        save_null_caption_embeddings(args.pipeline_load_from, max_length, accelerator.device,save_dir)
 
     # Load the saved embeddings and tokens
     null_caption_token, null_caption_embs = load_null_caption_embeddings(save_dir)
@@ -631,10 +653,12 @@ if __name__ == '__main__':
             m.clip_grad_norm_ = types.MethodType(clip_grad_norm_, m)
 
     # build dataloader
-    train_dataloader, val_loader = create_datasets(config.conf_data, rank, world_size)
+    train_dataloader, val_loader = create_datasets(config, rank, world_size)
     logger.info(f"Number of training samples: {len(train_dataloader.dataset)}")
     logger.info(f"Total number of batches: {len(train_dataloader)}")
-    logger.info(f"Batch size: {train_dataloader.batch_size}")
+    logger.info(f"Batch size per GPU: {config.train_batch_size}")
+    logger.info(f"Num Workers: {config.num_workers}")
+    logger.info(f"Effective Batch size: {config.train_batch_size * world_size * config.gradient_accumulation_steps}")
     timestamp = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
 
     # optimizer

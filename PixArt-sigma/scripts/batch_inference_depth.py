@@ -135,7 +135,10 @@ def pipe(image_tensor, hw, ensemble_size=10, batch_size=5, device='cpu'):
     """
     # Prepare the hw tensor
     hw_str = f"{int(hw[0])}:{int(hw[1])}"  # Convert to 'height:width' string
-    hw_tensor = get_default_hw(hw_str, base_ratios, device=device)
+    if not args.multi_scale:
+        hw_tensor = torch.tensor([[args.image_size, args.image_size]], device=device).float()
+    else:
+        hw_tensor = get_default_hw(hw_str, base_ratios, device=device)
 
     # Calculate latent sizes
     latent_size_h = int(hw_tensor[0, 0].item() // 8)
@@ -331,7 +334,7 @@ def process_image(args):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--image_size', default=1024, type=int)
+    parser.add_argument('--image_size', default=None, type=int)
     parser.add_argument('--version', default='sigma', type=str)
     parser.add_argument(
         "--pipeline_load_from", default='output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
@@ -346,6 +349,7 @@ def get_args():
     parser.add_argument('--step', default=-1, type=int)
     parser.add_argument('--output_dir',default="/data/om/depth-estimation-dit/PixArt-sigma/output", type=str )
     parser.add_argument('--is_depth', action='store_true')
+    parser.add_argument('--multi_scale', action='store_true')
     parser.add_argument("--base_data_dir", type=str, default='/data/om/data/eval_dataset', required=False, help="Path to base data directory.")
     parser.add_argument('--ensemble_size', default=10, type=int, help="Size of the ensemble for predictions.")
     parser.add_argument('--batch_size', default=10, type=int, help="Batch size for processing images.")
@@ -423,17 +427,6 @@ if __name__ == '__main__':
     print(f"Using device: {device} with dtype: {weight_dtype}")
     assert args.sampling_algo in ['iddpm', 'dpm-solver', 'sa-solver']
 
-    # Check for saved embeddings, or save them if not present
-    save_dir = "output/null_embedding"
-    null_caption_token_path = os.path.join(save_dir, "null_caption_token.pt")
-    null_caption_embs_path = os.path.join(save_dir, "null_caption_embs.pt")
-    if not (os.path.exists(null_caption_token_path) and os.path.exists(null_caption_embs_path)):
-        save_null_caption_embeddings(args.pipeline_load_from)
-
-    # Load saved embeddings
-    null_caption_token, null_caption_embs = load_null_caption_embeddings(save_dir)
-    null_caption_token = null_caption_token.to(device)
-    null_caption_embs = null_caption_embs.to(device)
 
     # Set latent size and model parameters
     latent_size = args.image_size // 8
@@ -446,8 +439,20 @@ if __name__ == '__main__':
         'sa-solver': 25
     }[args.sampling_algo]
 
+    # Check for saved embeddings, or save them if not present
+    save_dir = f"output/null_embedding/{max_sequence_length}"
+    if not (os.path.exists(os.path.join(save_dir, "null_caption_token.pt")) and
+            os.path.exists(os.path.join(save_dir, "null_caption_embs.pt"))):
+        save_null_caption_embeddings(args.pipeline_load_from, max_sequence_length, device,save_dir)
+
+    # Load the saved embeddings and tokens
+    null_caption_token, null_caption_embs = load_null_caption_embeddings(save_dir)
+    null_caption_token = null_caption_token.to(device)
+    null_caption_embs = null_caption_embs.to(device)
+
+
     # Initialize the model with appropriate configuration
-    if args.image_size in [512, 1024, 2048] or args.version == 'sigma':
+    if (args.image_size in [512, 1024, 2048] or args.version == 'sigma') and args.multi_scale:
         model = PixArtMS_XL_2(
             input_size=latent_size,
             pe_interpolation=pe_interpolation,
@@ -460,7 +465,7 @@ if __name__ == '__main__':
             pe_interpolation=pe_interpolation,
             model_max_length=max_sequence_length
         ).to(device, dtype=weight_dtype)
-
+    print(model)
     print(f"Generating sample from checkpoint: {args.model_path}")
     state_dict = find_model(args.model_path)['state_dict']
     state_dict.pop('pos_embed', None)
@@ -478,7 +483,10 @@ if __name__ == '__main__':
     model.eval()  # Set model to evaluation mode
 
     # Load the VAE model with appropriate dtype
-    vae_path = "output/pretrained_models/sd-vae-ft-ema" if args.sdvae else os.path.join(args.pipeline_load_from, "vae")
+    if args.version == "alpha":
+        vae_path = "stabilityai/sd-vae-ft-ema"
+    else:
+        vae_path = "output/pretrained_models/sd-vae-ft-ema" if args.sdvae else os.path.join(args.pipeline_load_from, "vae")
     vae = AutoencoderKL.from_pretrained(vae_path).to(device, dtype=weight_dtype)
     print(f"Loaded VAE from: {vae_path}")
 
@@ -502,4 +510,19 @@ python scripts/batch_inference_depth.py \
     --batch_size 1 \
     --step -1 \
     --is_depth \
+"""
+
+"""
+python scripts/batch_inference_depth.py \
+    --model_path /data/om/models/depth_512_mixed_training/checkpoints/epoch_11_step_52000.pth \
+    --base_data_dir /data/om/data/eval_dataset \
+    --config_path configs/dataset/data_nyu_test.yaml \
+    --output_dir /data/om/models/depth_512_mixed_training/batch_eval/epoch_11_step_52000/prediction \
+    --sampling_algo dpm-solver \
+    --ensemble_size 1 \
+    --version alpha \
+    --batch_size 1 \
+    --step -1 \
+    --is_depth \
+    --image_size 512 \
 """

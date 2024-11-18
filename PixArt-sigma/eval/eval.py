@@ -260,14 +260,22 @@ if "__main__" == __name__:
     with open(_save_to, "w+") as f:
         f.write(eval_text)
         logging.info(f"Evaluation metrics saved to {_save_to}")
+        print(f"Evaluation metrics saved to: {_save_to}")
 
 
 """
-python eval.py \
+python eval/eval.py \
     --base_data_dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/Marigold/eval_dataset \
-    --dataset_config config/new_benchmark_dataset/data_nyu_test.yaml \
+    --dataset_config configs/new_benchmark_dataset/data_nyu_test.yaml \
     --alignment least_square \
     --prediction_dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/batch_eval/nyu_test/prediction \
     --output_dir /mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/DiT/results/batch_eval/nyu_test/eval_metric \
+
+python eval/eval.py \
+    --base_data_dir /data/om/data/eval_dataset \
+    --dataset_config configs/dataset/data_nyu_test.yaml \
+    --alignment least_square \
+    --prediction_dir /data/om/models/pixart-alpha-512x512/batch_eval_ens_10/epoch_8_step_40000/prediction \
+    --output_dir /data/om/models/pixart-alpha-512x512/batch_eval_ens_10/epoch_8_step_40000/eval_metric \
 
 """

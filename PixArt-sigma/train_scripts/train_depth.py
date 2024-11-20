@@ -141,8 +141,9 @@ def log_validation(model, loader, vae, device, step):
             )
         
         latent_size_h, latent_size_w = rgb_input_latent.shape[2], rgb_input_latent.shape[3]
-
-        # Embedding preparation
+        # print(f"Latent: {rgb_input_latent.device}")
+        # print(f" Device: {vae.device}")
+        # print(f"Device: {next(model.parameters()).device}")
         emb_masks = null_caption_token.attention_mask
         caption_embs = null_caption_embs
         null_y = null_caption_embs.repeat(1, 1, 1)
@@ -307,10 +308,6 @@ def train():
     log_buffer = LogBuffer()
     
     global_step = start_step + 1
-    if hasattr(config, 'num_iterations'):
-        total_iterations = config.num_iterations
-    else:
-        total_iterations = config.num_epochs * len(train_dataloader)  # Calculate total iterations
 
     epoch = 0
 
@@ -321,21 +318,6 @@ def train():
 
     data_time_start = time.time()
     data_time_all = 0
-    
-    if config.lr_scheduler:
-        if config.cosine_annealing:
-            print("cosine annealing")
-            lr_scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=lambda step: cosine_annealing_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
-            )
-
-        else:
-            lr_scheduler = LambdaLR(
-            optimizer,
-            lr_lambda=lambda step: linear_decay_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
-            )
-
     # Iteration-based training loop
     for step in tqdm(range(global_step, total_iterations + 1), initial=global_step, total=total_iterations, desc="Training Progress"):
         grad_norm = None
@@ -345,7 +327,7 @@ def train():
             train_loader_iter = iter(train_dataloader)
         
         batch = next(train_loader_iter)  # Sample the next batch
-        # print(batch["rgb_relative_path"])
+        logger.info(f'Step: {step}, Batch Images: {", ".join(batch["rgb_relative_path"])}')
         rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=torch.float16)
         depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=torch.float16)
 
@@ -366,7 +348,7 @@ def train():
         torch.cuda.empty_cache()
 
         bs = rgb_input_latent.shape[0]
-        y = null_caption_embs.unsqueeze(0).repeat(bs, 1, 1, 1).detach()
+        y = null_caption_embs.unsqueeze(0).repeat(bs, 1, 1, 1).detach().to(accelerator.device)
         timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=accelerator.device).long()
 
         data_time_all += time.time() - data_time_start
@@ -458,7 +440,7 @@ def train():
                 )
 
         # Validation and visualization (optional)
-        if config.visualize and step % config.eval_sampling_steps == 0 or step==0:
+        if config.visualize and step % config.eval_sampling_steps == 0 or step==1:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 log_validation(model, val_loader, vae, accelerator.device, step)
@@ -610,6 +592,8 @@ if __name__ == '__main__':
 
     # Load the saved embeddings and tokens
     null_caption_token, null_caption_embs = load_null_caption_embeddings(save_dir)
+    null_caption_embs = null_caption_embs.to(accelerator.device)
+    null_caption_token = null_caption_token.to(accelerator.device)
 
     # build models
     train_diffusion = IDDPM(str(config.train_sampling_steps), learn_sigma=learn_sigma, pred_sigma=pred_sigma, snr=config.snr_loss)
@@ -662,9 +646,25 @@ if __name__ == '__main__':
     timestamp = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
 
     # optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.optimizer["lr"], weight_decay=config.optimizer["weight_decay"])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
-    lr_scheduler = None
+    if hasattr(config, 'num_iterations'):
+        total_iterations = config.num_iterations
+    else:
+        total_iterations = config.num_epochs * len(train_dataloader)  # Calculate total iterations
+
+    if config.lr_scheduler:
+        if config.cosine_annealing:
+            lr_scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: cosine_annealing_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
+            )
+
+        else:
+            lr_scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: linear_decay_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
+            )
 
     if accelerator.is_main_process:
         tracker_config = dict(vars(config))
@@ -720,3 +720,58 @@ python -m torch.distributed.launch --nproc_per_node=2 --master_port=12345 \
           --debug \
           --report_to wandb
 """
+
+#TODO
+"""
+- log epoch and steps in ever steps
+- log batch files in offline training logger
+"""
+
+'''
+import numpy as np
+from collections import deque
+
+# Parameters
+window_size = 50  # Size of the sliding window
+
+# Initialize a deque to store the most recent losses
+loss_window = deque(maxlen=window_size)
+
+def calculate_loss_variance(loss):
+    """
+    Updates the sliding window with the new loss value and calculates variance.
+    
+    Args:
+        loss (float): Current loss value from training.
+
+    Returns:
+        float: Variance of the losses in the sliding window. Returns None if window is not full yet.
+    """
+    # Add the current loss to the sliding window
+    loss_window.append(loss)
+    
+    # Only calculate variance if the window is full
+    if len(loss_window) == window_size:
+        # Convert deque to numpy array for computation
+        loss_array = np.array(loss_window)
+        # Calculate mean
+        mean_loss = np.mean(loss_array)
+        # Calculate variance
+        variance = np.mean((loss_array - mean_loss) ** 2)
+        return variance
+    else:
+        # Return None if the window is not full
+        return None
+
+# Example usage in training loop
+for iteration in range(1, 1000):  # Simulate 1000 iterations
+    # Simulated loss value (replace this with actual loss)
+    simulated_loss = np.random.random() * 0.1 + 0.02  # Simulated small random loss
+    
+    # Calculate loss variance
+    variance = calculate_loss_variance(simulated_loss)
+    
+    if variance is not None:
+        print(f"Iteration {iteration}: Loss Variance = {variance:.6f}")
+
+'''

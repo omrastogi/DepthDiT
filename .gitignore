@@ -30,3 +30,7 @@ env.bak/
 venv.bak/
 
 PixArt-sigma/pixart-sigma-toy-dataset
+depth_datasets/
+model_checkpoints/
+embeddings/
+process_data/checkpoints/

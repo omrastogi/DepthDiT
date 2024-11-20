@@ -28,7 +28,7 @@ python tools/download.py # environment eg. HF_ENDPOINT=https://hf-mirror.com can
 
 ---
 
-# Training
+# Training PIxart-alpha
 
 ### Training from scratch
 

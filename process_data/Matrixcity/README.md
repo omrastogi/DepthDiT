@@ -1,12 +1,19 @@
 # MatrixCity For Depth 
 
 ```
-pip install tarfile
+pip install tarfile open_clip gradio
 ```
 ### Download Big City
 ```bash
 python big_city_download/download.py --dataset_dir MatrixCity --depth --rgb          
 ```
+
+### Concatenate 
+Make sure to concatenate the subtar files.
+```
+cat tar.00 tar01 tar02
+```
+
 ### Add the base dir to environment
 ```bash
 export BASE_DIR=/mnt/c1e1833e-4df6-4c4c-88aa-8cd3d7d3932b/om/MatrixCity/MatrixCity

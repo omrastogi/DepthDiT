@@ -17,8 +17,12 @@ assert os.path.exists(base_path), f"Error: The directory {base_path} does not ex
 #%%
 from joblib import Parallel, delayed
 from tqdm import tqdm
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
+import logging
 from numba import njit
+
+logging.basicConfig(filename='csv/filter_error.log', level=logging.ERROR, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
 @njit
 def fast_histogram(data, bin_edges):
@@ -50,9 +54,17 @@ def load_files_for_batch(batch_rows):
 
 # Function to load files (I/O for a single row)
 def load_files(row):
-    rgb_image = Image.open(row.rgb_file_path).convert("RGB")
-    depth_image, invalid_mask = load_depth(row.file_path)
-    return rgb_image, depth_image
+    try:
+        rgb_image = Image.open(row.rgb_file_path).convert("RGB")
+        depth_image, invalid_mask = load_depth(row.file_path)
+        return rgb_image, depth_image
+    except UnidentifiedImageError:
+        logging.error(f"Unidentified image error for file: {row.rgb_file_path}")
+    except FileNotFoundError:
+        logging.error(f"File not found: {row.file_path}")
+    except Exception as e:
+        logging.error(f"Error processing file: {row.file_path} - {e}")
+    return None  # Return None for problematic cases
 
 # Initialize results
 results = []
@@ -74,30 +86,32 @@ try:
 
         # Sequentially process the batch for depth-related calculations
         for depth_image, aesthetic_score in zip(depth_images, aesthetic_scores):
-            depth_image_real = depth_image.copy()
-            mean_depth = np.mean(depth_image)
-            median_depth = np.median(depth_image)
-            variance_depth = np.var(depth_image)
-            depth_image_norm = (depth_image - depth_image.min()) / (depth_image.max() - depth_image.min())
-            depth_image_clipped = np.clip(depth_image_norm, 0, 1)
-            # histogram, bin_edges = np.histogram(depth_image_clipped, bins=10, range=(0, 1))
-            histogram = fast_histogram(depth_image_norm, bin_edges)
-            count_above_4000 = (histogram > 4000).sum()
-            count_above_1000 = (histogram > 1000).sum()
-            variance_histogram = np.var(histogram)
+            try:
+                depth_image_real = depth_image.copy()
+                mean_depth = np.mean(depth_image)
+                median_depth = np.median(depth_image)
+                variance_depth = np.var(depth_image)
+                depth_image_norm = (depth_image - depth_image.min()) / (depth_image.max() - depth_image.min())
+                depth_image_clipped = np.clip(depth_image_norm, 0, 1)
+                histogram = fast_histogram(depth_image_norm, bin_edges)
+                count_above_4000 = (histogram > 4000).sum()
+                count_above_1000 = (histogram > 1000).sum()
+                variance_histogram = np.var(histogram)
 
-            result = {
-                "Mean Depth": mean_depth,
-                "Median Depth": median_depth,
-                "Variance Depth": variance_depth,
-                "Aesthetic Score": aesthetic_score,
-                "Max Depth": depth_image_real.max(),
-                "Min Depth": depth_image_real.min(),
-                "Above 1000": count_above_1000,
-                "Above 4000": count_above_4000,
-                "Variance in Histogram": variance_histogram
-            }
-            results.append(result)
+                result = {
+                    "Mean Depth": mean_depth,
+                    "Median Depth": median_depth,
+                    "Variance Depth": variance_depth,
+                    "Aesthetic Score": aesthetic_score,
+                    "Max Depth": depth_image_real.max(),
+                    "Min Depth": depth_image_real.min(),
+                    "Above 1000": count_above_1000,
+                    "Above 4000": count_above_4000,
+                    "Variance in Histogram": variance_histogram
+                }
+                results.append(result)
+            except Exception as e:
+                logging.error(f"Error processing depth image: {e}")
 
 except KeyboardInterrupt:
     print("Process interrupted by user. Saving progress...")

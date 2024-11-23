@@ -322,7 +322,7 @@ def train():
     # Iteration-based training loop
     for step in tqdm(range(global_step, total_iterations + 1), initial=global_step, total=total_iterations, desc="Training Progress"):
         grad_norm = None
-        if step % len(train_dataloader) == 0 or step==1:
+        if step % len(train_dataloader) == 0 or step==start_step+1:
             epoch += 1
             # train_dataloader.sampler.set_epoch(epoch)
             train_loader_iter = iter(train_dataloader)
@@ -378,7 +378,8 @@ def train():
                 model_kwargs=dict(
                     y=y, 
                     mask=None,
-                    input_latent=rgb_input_latent
+                    input_latent=rgb_input_latent,
+                    bypass_cross_attn=config.bypass_cross_attn
                 ),
                 valid_mask=valid_mask_down,
                 noise=noise
@@ -540,6 +541,23 @@ if __name__ == '__main__':
     even_batches = True
     if config.multi_scale:
         even_batches=False,
+    
+
+    # #-----------------
+    # from accelerate.utils import DistributedDataParallelKwargs
+
+    # # Specify find_unused_parameters=True for DDP
+    # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
+    # accelerator = Accelerator(
+    #     mixed_precision=config.mixed_precision,
+    #     gradient_accumulation_steps=config.gradient_accumulation_steps,
+    #     log_with=args.report_to,
+    #     project_dir=os.path.join(config.work_dir, "logs"),
+    #     fsdp_plugin=fsdp_plugin,
+    #     even_batches=even_batches,
+    #     kwargs_handlers=[init_handler, ddp_kwargs]  # Add ddp_kwargs here
+    # )
 
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,

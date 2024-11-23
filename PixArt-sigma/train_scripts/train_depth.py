@@ -605,6 +605,7 @@ if __name__ == '__main__':
                         **model_kwargs).train()
     logger.info(f"{model.__class__.__name__} Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # Loading DiT Depth
     dit_params_path = "/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/DiT/checkpoints/DiT-XL-2-512x512.pt"
     # Load the parameters
     dit_params = torch.load(dit_params_path)
@@ -616,7 +617,7 @@ if __name__ == '__main__':
                 if not torch.equal(param[1].data, dit_params[param[0]]):
                     dit_params[param[0]] = dit_params[param[0]].to(param[1].device)
                     param[1].data.copy_(dit_params[param[0]])
-    
+
     if args.load_from is not None:
         config.load_from = args.load_from
 
@@ -626,7 +627,6 @@ if __name__ == '__main__':
                 config.load_from, model, load_ema=config.get('load_ema', False), max_length=max_length)
             logger.warning(f'Missing keys: {missing}')
             logger.warning(f'Unexpected keys: {unexpected}')
-
 
     if args.is_depth:
         # For Depth DiT model: The state_dict is already modified for depth, so modify the model before loading

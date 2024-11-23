@@ -36,6 +36,7 @@ class PixArtBlock(nn.Module):
             qk_norm=qk_norm, **block_kwargs
         )
         self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
+        self.cross_attn.requires_grad_(False) # In order to BYPASS_CROSS_ATTN        
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -44,13 +45,19 @@ class PixArtBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size ** 0.5)
         self.sampling = sampling
         self.sr_ratio = sr_ratio
+        # Initialize the bypass_cross_attn attribute
+        self.bypass_cross_attn = False  # Default value
+
 
     def forward(self, x, y, t, mask=None, **kwargs):
         B, N, C = x.shape
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
         x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(self.norm1(x), shift_msa, scale_msa)).reshape(B, N, C))
-        x = x + self.cross_attn(x, y, mask)
+        # Conditionally apply Cross-Attention
+        if not self.bypass_cross_attn:
+            x = x + self.cross_attn(x, y, mask)
+        # x = x + self.cross_attn(x, y, mask)
         x = x + self.drop_path(gate_mlp * self.mlp(t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)))
 
         return x
@@ -169,8 +176,14 @@ class PixArt(nn.Module):
         else:
             y_lens = [y.shape[2]] * y.shape[0]
             y = y.squeeze(1).view(1, -1, x.shape[-1])
+        bypass_cross_attn = kwargs.pop('bypass_cross_attn', False)
         for block in self.blocks:
+            block.bypass_cross_attn = bypass_cross_attn
             x = auto_grad_checkpoint(block, x, y, t0, y_lens)  # (N, T, D) #support grad checkpoint
+
+        # for block in self.blocks:
+        #     x = auto_grad_checkpoint(block, x, y, t0, y_lens)  # (N, T, D) #support grad checkpoint
+        
         x = self.final_layer(x, t)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x

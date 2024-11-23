@@ -116,6 +116,21 @@ def cosine_annealing_lr_schedule(current_step, start_step, total_steps):
         progress = (current_step - start_step) / decay_steps
         return 0.5 * (1 + math.cos(math.pi * progress))  # Cosine annealing
 
+def convert_depth_to_colored(depth):
+        # Normalize depth values between 0 and 1
+        depth_pred = (depth + 1.0) / 2.0
+        depth_pred = depth_pred.squeeze().detach().cpu().numpy()
+        depth_pred = depth_pred.clip(0, 1)
+
+        # Colorize depth maps using a colormap
+        depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+
+        # Convert to uint8 for wandb logging
+        depth_colored = (depth_colored * 255).astype(np.uint8)
+        depth_colored_hwc = chw2hwc(depth_colored)
+        return depth_colored_hwc
+
+
 
 @torch.inference_mode()
 def log_validation(model, loader, vae, device, step):
@@ -128,7 +143,7 @@ def log_validation(model, loader, vae, device, step):
     batch = next(iter(loader))
     rgb = batch["rgb_norm"].to(device).to(torch.float16)
     rgb_int = batch["rgb_int"].to(device).to(torch.float16)  # Real RGB images from batch
-
+    gt_depth = batch["depth_raw_norm"].to(device).to(torch.float16)
     # Mentioning params
     batch_size = rgb.shape[0]
 
@@ -179,31 +194,24 @@ def log_validation(model, loader, vae, device, step):
         # Decode the depth from latent space
         depth = decode_depth(samples, vae)
         depth = torch.clip(depth, -1.0, 1.0)  # TODO: Check this step
-
-        # Normalize depth values between 0 and 1
-        depth_pred = (depth + 1.0) / 2.0
-        depth_pred = depth_pred.squeeze().detach().cpu().numpy()
-        depth_pred = depth_pred.clip(0, 1)
-
-        # Colorize depth maps using a colormap
-        depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
-
-        # Convert to uint8 for wandb logging
-        depth_colored = (depth_colored * 255).astype(np.uint8)
-        depth_colored_hwc = chw2hwc(depth_colored)
-
+        # calulate colored depth
+        depth_colored_hwc = convert_depth_to_colored(depth)
+        gt_depth_colored_hwc = convert_depth_to_colored(gt_depth.select(0, i).unsqueeze(0))
+        
         # Log depth image to wandb
-        wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Depth Image {i}"))
+        wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Pred Depth {i}"))
+        wandb_images.append(wandb.Image(gt_depth_colored_hwc, caption=f"Gt Depth {i}"))
 
         # Also log real image from rgb_int
         real_image_np = rgb_int[i].detach().cpu().numpy()
         real_image_hwc = chw2hwc(real_image_np)
-        wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {i}"))
-        del z, rgb_input_latent, samples, depth, depth_pred, depth_colored, real_image_np
+
+        wandb_images.append(wandb.Image(real_image_hwc, caption=f"Input Rgb {i}"))
+        del z, rgb_input_latent, samples, depth, real_image_np
 
 
     # Log all images to wandb
-    wandb.log({f"validation_images_step": wandb_images, "step": step})
+    wandb.log({f"validation_images": wandb_images, "step": step})
 
     print("Validation completed and images logged to wandb.")
     gc.collect()
@@ -328,7 +336,7 @@ def train():
             train_loader_iter = iter(train_dataloader)
         
         batch = next(train_loader_iter)  # Sample the next batch
-        logger.info(f'Step: {step}, Batch Images: {", ".join(batch["rgb_relative_path"])}')
+        # logger.info(f'Step: {step}, Batch Images: {", ".join(batch["rgb_relative_path"])}')
         rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=torch.float16)
         depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=torch.float16)
 
@@ -357,7 +365,7 @@ def train():
         if config.multi_res_noise is not None:
             strength = config.multi_res_noise_strength
             if config.multi_res_noise_annealing:
-                # Calculate strength depending on t
+                # Calculate strength depending on timesteps
                 strength = strength * (timesteps / train_diffusion.num_timesteps)
                 noise = multi_res_noise_like(
                     depth_gt_latent,
@@ -635,7 +643,7 @@ if __name__ == '__main__':
                 if not torch.equal(param[1].data, dit_params[param[0]]):
                     dit_params[param[0]] = dit_params[param[0]].to(param[1].device)
                     param[1].data.copy_(dit_params[param[0]])
-
+    print("Overridden PixArt weights with DiT weights")
     if args.load_from is not None:
         config.load_from = args.load_from
 

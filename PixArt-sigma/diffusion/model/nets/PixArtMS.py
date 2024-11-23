@@ -62,7 +62,7 @@ class PixArtMSBlock(nn.Module):
         )
 
         self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
-        self.cross_attn.requires_grad_(False)
+        self.cross_attn.requires_grad_(False) # In order to BYPASS_CROSS_ATTN
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
         approx_gelu = lambda: nn.GELU(approximate="tanh")

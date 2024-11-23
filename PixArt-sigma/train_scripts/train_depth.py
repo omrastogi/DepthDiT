@@ -314,6 +314,7 @@ def train():
     # Initialize tracking (e.g., WandB)
     if accelerator.is_main_process and args.report_to == "wandb":
         wandb.init(project=args.tracker_project_name, config=config)
+        wandb.run.log_code(".")
         accelerator.init_trackers(args.tracker_project_name, config)
 
     data_time_start = time.time()
@@ -578,12 +579,10 @@ if __name__ == '__main__':
 
     logger.info(f"vae scale factor: {config.scale_factor}")
 
-
     model_kwargs = {"pe_interpolation": config.pe_interpolation, "config": config,
                     "model_max_length": max_length, "qk_norm": config.qk_norm,
                     "kv_compress_config": kv_compress_config, "micro_condition": config.micro_condition}
     
-
     # Check if the .pt files exist, otherwise save them
     save_dir = f"output/null_embedding/{max_length}"
     if not (os.path.exists(os.path.join(save_dir, "null_caption_token.pt")) and
@@ -605,6 +604,18 @@ if __name__ == '__main__':
                         pred_sigma=pred_sigma,
                         **model_kwargs).train()
     logger.info(f"{model.__class__.__name__} Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    dit_params_path = "/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/DiT/checkpoints/DiT-XL-2-512x512.pt"
+    # Load the parameters
+    dit_params = torch.load(dit_params_path)
+    for param in model.named_parameters():
+        if param[0] in dit_params.keys():
+            # Check if the shapes match first
+            if param[1].shape == dit_params[param[0]].shape:
+                # If shapes match, compare the tensors
+                if not torch.equal(param[1].data, dit_params[param[0]]):
+                    dit_params[param[0]] = dit_params[param[0]].to(param[1].device)
+                    param[1].data.copy_(dit_params[param[0]])
     
     if args.load_from is not None:
         config.load_from = args.load_from
@@ -618,13 +629,11 @@ if __name__ == '__main__':
 
 
     if args.is_depth:
-        # For Depth DiT model
-        # The state_dict is already modified for depth, so modify the model before loading
+        # For Depth DiT model: The state_dict is already modified for depth, so modify the model before loading
         model = _replace_patchembed_proj(model)
         load_model()
     else:
-        # For a vanilla DiT model
-        # Load the state_dict first, and then modify the model afterwards
+        # For a vanilla DiT model: First the state_dict, and then modify the model afterwards
         load_model()
         model = _replace_patchembed_proj(model)
     

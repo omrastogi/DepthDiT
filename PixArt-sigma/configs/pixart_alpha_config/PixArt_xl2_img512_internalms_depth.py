@@ -18,25 +18,30 @@ multi_scale = True     # if use multiscale dataset model training
 pe_interpolation = 1.0
 
 # dataloader settings
-num_workers=2
-train_batch_size = 10   # max 40 for PixArt-xL/2 when grad_checkpoint
+num_workers = 2
+train_batch_size = 8   # max 40 for PixArt-xL/2 when grad_checkpoint
 val_batch_size = 3
 
 # training setting
-num_epochs = 100 # 3
-num_iterations = 20000
+num_epochs = 200 # 3
+num_iterations = 40000
 gradient_accumulation_steps = 8
 grad_checkpointing = True
-gradient_clip = 1.0
 
 # optimizer setting
-lr = 4e-4
+gradient_clip = 1.0
+lr = 1e-4
 weight_decay=1e-4
 optimizer = dict(type='AdamW', lr=lr, weight_decay=weight_decay)
 
+lr_scheduler = True 
+cosine_annealing = False
+start_step = 0
+
+# Validation and Logs
 eval_sampling_steps = 500
 visualize = True
-log_interval = 5
+log_interval = 4
 save_model_steps = 2000
 work_dir = '/mnt/51eb0667-f71d-4fe0-a83e-beaff24c04fb/om/depth_estimation_experiments/DiT/PixArt-sigma/output'
 
@@ -45,3 +50,4 @@ multi_res_noise = True
 multi_res_noise_strength = True
 multi_res_noise_annealing = 0.9
 multi_res_noise_downscale_strategy = "original" 
+

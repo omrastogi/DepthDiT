@@ -2,7 +2,7 @@ import fiftyone as fo
 import pandas as pd
 
 # Path to your CSV file
-csv_path = "filtered_images.csv"
+csv_path = "csv/final_data.csv"
 
 df = pd.read_csv(csv_path)
 

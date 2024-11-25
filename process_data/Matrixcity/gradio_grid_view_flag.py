@@ -4,15 +4,31 @@ import pandas as pd
 from PIL import Image
 from multiprocessing import Pool, Manager
 import tqdm
+import argparse
+import os
+
+# Set up argument parser
+parser = argparse.ArgumentParser(description="Gradio Grid View with Flagging")
+parser.add_argument('--csv_path', type=str, required=True, help='Path to the CSV file containing image data')
+parser.add_argument('--first_k', type=int, default=500, help='Number of images to display from the CSV file')
+parser.add_argument('--port', type=int, default=7860, help='Port to run the Gradio app on')
+
+args = parser.parse_args()
+
+# Get base dir
+assert 'BASE_DIR' in os.environ, "Error: 'BASE_DIR' is not set in the environment variables."
+base_dir = os.getenv("BASE_DIR")
+assert os.path.exists(base_dir), f"Error: The directory {base_dir} does not exist."
 
 # Read the CSV file
-csv = 'final_data1.csv'
+csv = args.csv_path
 port = 7860
 print(f"Loading Gallery for {csv} on {port}")
-selected_images = pd.read_csv(csv)[:5000]
+selected_images = pd.read_csv(csv)[:args.first_k]
 
 # Ensure paths are valid for demonstration (adjust this part as necessary)
-selected_images['rgb_filepath'] = selected_images['rgb_filepath'].apply(lambda x: x.strip())
+selected_images['rgb_file'] = selected_images['rgb_file'].apply(lambda x: x.strip())
+selected_images['rgb_file'] = selected_images['rgb_file'].apply(lambda x: os.path.join(base_dir, x))
 
 # In-memory dictionary to store flagged images
 flagged_images = {}
@@ -30,7 +46,7 @@ def create_thumbnail_in_memory(image_info):
 
 def generate_thumbnails_in_memory():
     """Generate thumbnails in memory with progress tracking."""
-    image_info = [(row['rgb_filepath'], idx) for idx, row in selected_images.iterrows()]
+    image_info = [(row['rgb_file'], idx) for idx, row in selected_images.iterrows()]
     images = []
     with Manager() as manager:
         with Pool() as pool:

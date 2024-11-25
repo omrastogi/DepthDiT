@@ -45,4 +45,12 @@ python filter.py
 python create_image_embeddings
 ```
 
-### For more use notebooks/clustering.ipynb
+### Extract Final representative images
+```bash
+python image_selection.py
+```
+
+### View Images 
+```bash 
+python gradio_grid_view_flag.py --csv_path csv/final_data_street_test_1k.csv --first_k 1000 --port 7860 
+```

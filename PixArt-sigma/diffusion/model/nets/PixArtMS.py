@@ -193,7 +193,7 @@ class PixArtMS(PixArt):
             t = t + torch.cat([csize, ar], dim=1)
 
         t0 = self.t_block(t)
-        y = self.y_embedder(y, self.training)  # (N, D) # y.shape=[2, 4, 300, 4096]
+        # y = self.y_embedder(y, self.training)  # (N, D) # y.shape=[2, 4, 300, 4096]
 
         if mask is not None:
             if mask.shape[0] != y.shape[0]:

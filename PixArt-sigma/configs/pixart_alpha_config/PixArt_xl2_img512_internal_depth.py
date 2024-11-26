@@ -18,7 +18,7 @@ pe_interpolation = 1.0
 # training setting
 use_fsdp=False   # if use FSDP mode
 num_workers=10
-train_batch_size = 38 # 32
+train_batch_size = 8 
 num_epochs = 200 # 3
 gradient_accumulation_steps = 1
 grad_checkpointing = True

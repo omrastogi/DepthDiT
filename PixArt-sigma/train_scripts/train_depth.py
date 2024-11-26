@@ -9,6 +9,7 @@ import warnings
 import argparse
 import datetime
 from tqdm import tqdm
+import torchvision.transforms.functional as F
 from pathlib import Path
 from copy import deepcopy
 from omegaconf import OmegaConf
@@ -41,7 +42,7 @@ from diffusion.utils.logger import get_root_logger, rename_file_with_creation_ti
 from diffusion.utils.lr_scheduler import build_lr_scheduler
 from diffusion.utils.misc import set_random_seed, read_config, init_random_seed, DebugUnderflowOverflow
 from diffusion.utils.optimizer import build_optimizer, auto_scale_lr
-
+from diffusion.model.nets.resampler import Resampler
 from src.dataset import BaseDepthDataset, DatasetMode, get_dataset
 from src.dataset.depth_transform import get_depth_normalizer
 from src.dataset.dist_mixed_sampler import DistributedMixedBatchSampler
@@ -128,6 +129,9 @@ def log_validation(model, loader, vae, device, step):
     batch = next(iter(loader))
     rgb = batch["rgb_norm"].to(device).to(torch.float16)
     rgb_int = batch["rgb_int"].to(device).to(torch.float16)  # Real RGB images from batch
+    with torch.no_grad():
+        bs = rgb.shape[0]
+        rgb_embedding = dinvov2_model(preprocess_tensor(rgb)).unsqueeze(1)
 
     # Mentioning params
     batch_size = rgb.shape[0]
@@ -144,15 +148,16 @@ def log_validation(model, loader, vae, device, step):
         # print(f"Latent: {rgb_input_latent.device}")
         # print(f" Device: {vae.device}")
         # print(f"Device: {next(model.parameters()).device}")
-        emb_masks = null_caption_token.attention_mask
-        caption_embs = null_caption_embs
-        null_y = null_caption_embs.repeat(1, 1, 1)
+        y = resampler(rgb_embedding[i].unsqueeze(0)).unsqueeze(1)
+        # emb_masks = null_caption_token.attention_mask
+        # caption_embs = null_caption_embs
+        null_y = y.repeat(1, 1, 1, 1)
 
         print(f'Finished embedding for image {i + 1}/{batch_size}')
 
         model_kwargs = {
             'data_info': None,
-            'mask': emb_masks,
+            'mask': None,
             'input_latent': rgb_input_latent
         }
         z = torch.randn(1, 4, latent_size_h, latent_size_w, device=device)
@@ -160,7 +165,7 @@ def log_validation(model, loader, vae, device, step):
         # Initialize DPM-Solver
         dpm_solver = DPMS(
             model.forward_with_dpmsolver,
-            condition=caption_embs,
+            condition=y,
             uncondition=null_y,
             cfg_scale=3.0,
             model_kwargs=model_kwargs
@@ -178,7 +183,9 @@ def log_validation(model, loader, vae, device, step):
         samples = samples.to(vae.dtype)
         # Decode the depth from latent space
         depth = decode_depth(samples, vae)
+        print(depth)
         depth = torch.clip(depth, -1.0, 1.0)  # TODO: Check this step
+        print(depth)
 
         # Normalize depth values between 0 and 1
         depth_pred = (depth + 1.0) / 2.0
@@ -199,6 +206,7 @@ def log_validation(model, loader, vae, device, step):
         real_image_np = rgb_int[i].detach().cpu().numpy()
         real_image_hwc = chw2hwc(real_image_np)
         wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {i}"))
+        torch.cuda.empty_cache() 
         del z, rgb_input_latent, samples, depth, depth_pred, depth_colored, real_image_np
 
 
@@ -294,6 +302,16 @@ def create_datasets(cfg, rank, world_size):
     )
     return train_loader, val_loader
 
+def preprocess_tensor(tensor):
+    # Resize to 518 while maintaining aspect ratio
+    resized = torch.stack([F.resize(img, 518) for img in tensor])
+    # Center crop to [518, 518]
+    cropped = torch.stack([F.center_crop(img, (518, 518)) for img in resized])
+    # Normalize to mean=[0.5, 0.5, 0.5] and std=[0.5, 0.5, 0.5]
+    normalized = torch.stack([
+        F.normalize(img, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) for img in cropped
+    ])
+    return normalized
 
 def train():
     if config.get('debug_nan', False):
@@ -327,10 +345,16 @@ def train():
             train_loader_iter = iter(train_dataloader)
         
         batch = next(train_loader_iter)  # Sample the next batch
-        logger.info(f'Step: {step}, Batch Images: {", ".join(batch["rgb_relative_path"])}')
+        # logger.info(f'Step: {step}, Batch Images: {", ".join(batch["rgb_relative_path"])}')
         rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=torch.float16)
         depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=torch.float16)
 
+        # Run inference
+        with torch.no_grad():
+            bs = rgb.shape[0]
+            rgb_embedding = dinvov2_model(preprocess_tensor(rgb)).unsqueeze(1)
+            y = resampler(rgb_embedding).unsqueeze(1)
+            
         if config.valid_mask_loss:
             valid_mask_for_latent = batch['valid_mask_raw']
             invalid_mask = ~valid_mask_for_latent
@@ -347,8 +371,8 @@ def train():
         del rgb, depth_gt_for_latent, valid_mask_for_latent
         torch.cuda.empty_cache()
 
-        bs = rgb_input_latent.shape[0]
-        y = null_caption_embs.unsqueeze(0).repeat(bs, 1, 1, 1).detach().to(accelerator.device)
+        # bs = rgb_input_latent.shape[0]
+        # y = null_caption_embs.unsqueeze(0).repeat(bs, 1, 1, 1).detach().to(accelerator.device)
         timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=accelerator.device).long()
 
         data_time_all += time.time() - data_time_start
@@ -578,7 +602,7 @@ if __name__ == '__main__':
 
     logger.info(f"vae scale factor: {config.scale_factor}")
 
-
+    max_length = 4
     model_kwargs = {"pe_interpolation": config.pe_interpolation, "config": config,
                     "model_max_length": max_length, "qk_norm": config.qk_norm,
                     "kv_compress_config": kv_compress_config, "micro_condition": config.micro_condition}
@@ -635,6 +659,10 @@ if __name__ == '__main__':
     if accelerator.distributed_type == DistributedType.FSDP:
         for m in accelerator._models:
             m.clip_grad_norm_ = types.MethodType(clip_grad_norm_, m)
+
+    dinvov2_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_reg')
+    dinvov2_model = accelerator.prepare(dinvov2_model)
+    model.eval()
 
     # build dataloader
     train_dataloader, val_loader = create_datasets(config, rank, world_size)
@@ -695,7 +723,8 @@ if __name__ == '__main__':
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
     # objects in the same order you gave them to the prepare method.
-
+    resampler = Resampler(num_queries=4)
+    resampler = accelerator.prepare(resampler)
     model = accelerator.prepare(model)
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
     train()

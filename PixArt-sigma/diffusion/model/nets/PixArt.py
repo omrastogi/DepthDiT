@@ -33,8 +33,7 @@ class PixArtBlock(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = AttentionKVCompress(
             hidden_size, num_heads=num_heads, qkv_bias=True, sampling=sampling, sr_ratio=sr_ratio,
-            qk_norm=qk_norm, **block_kwargs
-        )
+            qk_norm=qk_norm, **block_kwargs)
         self.cross_attn = MultiHeadCrossAttention(hidden_size, num_heads, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # to be compatible with lower version pytorch
@@ -47,7 +46,6 @@ class PixArtBlock(nn.Module):
 
     def forward(self, x, y, t, mask=None, **kwargs):
         B, N, C = x.shape
-
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
         x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(self.norm1(x), shift_msa, scale_msa)).reshape(B, N, C))
         x = x + self.cross_attn(x, y, mask)

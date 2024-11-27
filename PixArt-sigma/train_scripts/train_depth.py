@@ -10,6 +10,7 @@ import argparse
 import datetime
 from tqdm import tqdm
 import torchvision.transforms.functional as F
+import torchvision.transforms as T
 from pathlib import Path
 from copy import deepcopy
 from omegaconf import OmegaConf
@@ -96,15 +97,35 @@ def _replace_patchembed_proj(model):
     print("PatchEmbed projection layer has been replaced.")
     return model
 
-def linear_decay_lr_schedule(current_step, start_step, total_steps):
-    if current_step < start_step:
-        return 1.0  # Keep the learning rate at the base_lr
-    elif current_step >= total_steps:
-        return 0.0  # Fully decay to zero after total_steps
+def linear_decay_lr_schedule(current_step, warmup_steps, start_step, stop_step, base_lr, final_lr):
+    """
+    Args:
+        current_step (int): The current training step.
+        warmup_steps (int): Number of steps for warmup.
+        start_step (int): Step at which decay begins.
+        stop_step (int): Step at which the scheduler stops and reaches final_lr.
+        base_lr (float): The base learning rate (maximum value during training).
+        final_lr (float): The final learning rate value at stop_step.
+
+    Returns:
+        float: The learning rate at the current step.
+    """
+    final_lr_ratio = final_lr / base_lr  # Ratio between final and base LR
+
+    if warmup_steps > 0 and current_step < warmup_steps:
+        # Warmup phase: linearly increase from 0 to base_lr
+        lr = (current_step / warmup_steps)
+    elif current_step < start_step:
+        # After warmup but before decay begins: keep at base_lr
+        lr = 1.0
+    elif current_step >= stop_step:
+        # After stop_step: maintain final_lr
+        lr = final_lr_ratio
     else:
-        # Linearly decay the learning rate
-        decay_steps = total_steps - start_step
-        return 1.0 - (current_step - start_step) / decay_steps
+        # Linearly decay the learning rate multiplier from 1.0 to final_lr_ratio
+        decay_steps = stop_step - start_step
+        lr = 1.0 - ((current_step - start_step) / decay_steps) * (1.0 - final_lr_ratio)
+    return lr
     
 def cosine_annealing_lr_schedule(current_step, start_step, total_steps):
     if current_step < start_step:
@@ -149,9 +170,11 @@ def log_validation(model, loader, vae, device, step):
         # print(f" Device: {vae.device}")
         # print(f"Device: {next(model.parameters()).device}")
         y = resampler(rgb_embedding[i].unsqueeze(0)).unsqueeze(1)
+        # y = 2 * (y - y.min()) / (y.max() - y.min()) - 1
         # emb_masks = null_caption_token.attention_mask
         # caption_embs = null_caption_embs
-        null_y = y.repeat(1, 1, 1, 1)
+        null_y = torch.zeros_like(y)
+        # null_y = y.repeat(1, 1, 1, 1)
 
         print(f'Finished embedding for image {i + 1}/{batch_size}')
 
@@ -179,13 +202,15 @@ def log_validation(model, loader, vae, device, step):
             skip_type="time_uniform",
             method="multistep",
         )
-
         samples = samples.to(vae.dtype)
         # Decode the depth from latent space
         depth = decode_depth(samples, vae)
-        print(depth)
         depth = torch.clip(depth, -1.0, 1.0)  # TODO: Check this step
-        print(depth)
+        # print(depth)
+        if torch.isnan(samples).any():
+            print("Samples contain NaN values")
+        if torch.isnan(depth).any():
+            print("Depth contains NaN values")
 
         # Normalize depth values between 0 and 1
         depth_pred = (depth + 1.0) / 2.0
@@ -302,16 +327,21 @@ def create_datasets(cfg, rank, world_size):
     )
     return train_loader, val_loader
 
+# def preprocess_tensor(tensor):
+#     # Resize to 518 while maintaining aspect ratio
+#     resized = torch.stack([F.resize(img, 518) for img in tensor])
+#     # Center crop to [518, 518]
+#     cropped = torch.stack([F.center_crop(img, (518, 518)) for img in resized])
+#     # Normalize to mean=[0.5, 0.5, 0.5] and std=[0.5, 0.5, 0.5]
+#     normalized = torch.stack([
+#         F.normalize(img, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) for img in cropped
+#     ])
+#     return normalized
 def preprocess_tensor(tensor):
-    # Resize to 518 while maintaining aspect ratio
-    resized = torch.stack([F.resize(img, 518) for img in tensor])
-    # Center crop to [518, 518]
-    cropped = torch.stack([F.center_crop(img, (518, 518)) for img in resized])
-    # Normalize to mean=[0.5, 0.5, 0.5] and std=[0.5, 0.5, 0.5]
-    normalized = torch.stack([
-        F.normalize(img, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) for img in cropped
-    ])
-    return normalized
+    resize_transform = T.Resize((518, 518))
+    resized = torch.stack([resize_transform(img) for img in tensor])
+    # cropped = torch.stack([F.center_crop(img, (518, 518)) for img in resized])
+    return resized
 
 def train():
     if config.get('debug_nan', False):
@@ -353,7 +383,9 @@ def train():
         with torch.no_grad():
             bs = rgb.shape[0]
             rgb_embedding = dinvov2_model(preprocess_tensor(rgb)).unsqueeze(1)
-            y = resampler(rgb_embedding).unsqueeze(1)
+            
+        y = resampler(rgb_embedding).unsqueeze(1)
+        # y = 2 * (y - y.min()) / (y.max() - y.min()) - 1
             
         if config.valid_mask_loss:
             valid_mask_for_latent = batch['valid_mask_raw']
@@ -435,7 +467,15 @@ def train():
                     grad_norm_internal = param.grad.data.norm(2).item()
                     # Store the gradient norm with a prefix for WandB grouping
                     gradient_norms[f'gradient_norm/{name}'] = grad_norm_internal
+                    
+            perciever_resampler_gradients = {}
+            for name, param in resampler.named_parameters():
+                if param.grad is not None:
+                    grad_norm_internal = param.grad.data.norm(2).item()
+                    perciever_resampler_gradients[f'perciever_resampler_gradients/{name}'] = grad_norm_internal
+
             logs.update(gradient_norms)
+            logs.update(perciever_resampler_gradients)
             logs.update(lr=lr)
             last_tic = time.time()
             log_buffer.clear()
@@ -602,7 +642,7 @@ if __name__ == '__main__':
 
     logger.info(f"vae scale factor: {config.scale_factor}")
 
-    max_length = 4
+    max_length = 16
     model_kwargs = {"pe_interpolation": config.pe_interpolation, "config": config,
                     "model_max_length": max_length, "qk_norm": config.qk_norm,
                     "kv_compress_config": kv_compress_config, "micro_condition": config.micro_condition}
@@ -673,8 +713,11 @@ if __name__ == '__main__':
     logger.info(f"Effective Batch size: {config.train_batch_size * world_size * config.gradient_accumulation_steps}")
     timestamp = time.strftime("%Y-%m-%d_%H:%M:%S", time.localtime())
 
+    resampler = Resampler(num_queries=max_length).train()
+    resampler.requires_grad_(True)
+
     # optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = torch.optim.AdamW(list(model.parameters()) + list(resampler.parameters()), lr=config.lr, weight_decay=config.weight_decay)
 
     if hasattr(config, 'num_iterations'):
         total_iterations = config.num_iterations
@@ -689,9 +732,13 @@ if __name__ == '__main__':
             )
 
         else:
+            warmup = config.warmup_steps if hasattr(config, 'warmup_steps') else 0
+            stop_step = config.stop_step if hasattr(config, 'stop_step') else total_iterations
+            final_lr = config.final_lr if hasattr(config, 'final_lr') else 1e-10 # some very small value
+                
             lr_scheduler = LambdaLR(
             optimizer,
-            lr_lambda=lambda step: linear_decay_lr_schedule(step, start_step=config.start_step, total_steps=total_iterations),
+            lr_lambda=lambda step: linear_decay_lr_schedule(step, warmup_steps=warmup, start_step=config.start_step, stop_step=stop_step, base_lr=config.lr, final_lr=final_lr),
             )
 
     if accelerator.is_main_process:
@@ -723,10 +770,8 @@ if __name__ == '__main__':
     # Prepare everything
     # There is no specific order to remember, you just need to unpack the
     # objects in the same order you gave them to the prepare method.
-    resampler = Resampler(num_queries=4)
-    resampler = accelerator.prepare(resampler)
-    model = accelerator.prepare(model)
-    optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+    # model, resampler = accelerator.prepare(model, resampler)
+    model, resampler, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, resampler, optimizer, train_dataloader, lr_scheduler)
     train()
 
 """

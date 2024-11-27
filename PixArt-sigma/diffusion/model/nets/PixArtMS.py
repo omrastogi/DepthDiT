@@ -79,9 +79,9 @@ class PixArtMSBlock(nn.Module):
         return x
 
 
-#############################################################################
-#                                 Core PixArt Model                                #
-#################################################################################
+##################################################################################
+#                                 Core PixArt Model                              #
+##################################################################################
 @MODELS.register_module()
 class PixArtMS(PixArt):
     """
@@ -137,6 +137,7 @@ class PixArtMS(PixArt):
         )
         self.x_embedder = PatchEmbed(patch_size, in_channels, hidden_size, bias=True)
         self.y_embedder = CaptionEmbedder(in_channels=caption_channels, hidden_size=hidden_size, uncond_prob=class_dropout_prob, act_layer=approx_gelu, token_num=model_max_length)
+        self.y_embedder.requires_grad_(False)
         self.micro_conditioning = micro_condition
         if self.micro_conditioning:
             self.csize_embedder = SizeEmbedder(hidden_size//3)  # c_size embed

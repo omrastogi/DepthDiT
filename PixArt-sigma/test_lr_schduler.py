@@ -1,7 +1,5 @@
 def linear_decay_lr_schedule(current_step, warmup_steps, start_step, stop_step, base_lr, final_lr):
     """
-    Learning rate schedule with warmup and linear decay to a specified final_lr, using ratio.
-
     Args:
         current_step (int): The current training step.
         warmup_steps (int): Number of steps for warmup.
@@ -31,12 +29,12 @@ def linear_decay_lr_schedule(current_step, warmup_steps, start_step, stop_step, 
     return lr
 
 
-base_lr = 3e-4     # Starting learning rate
+base_lr = 2e-4     # Starting learning rate
 final_lr = 1e-5    # Final learning rate after decay
-warmup_steps = 1000   # Number of steps to warm up
+warmup_steps = 500   # Number of steps to warm up
 start_step = 1000    # Step at which decay starts
-stop_step = 30000     # Step at which decay ends
-total_steps = 40000   # Total number of training steps
+stop_step = 5000     # Step at which decay ends
+total_steps = 6000   # Total number of training steps
 
 import plotly.graph_objects as go
 import torch
@@ -69,7 +67,10 @@ for step in steps:
     optimizer.step()  # Dummy optimizer step
     lr_scheduler.step()  # Update the scheduler
     learning_rates.append(optimizer.param_groups[0]['lr'])  # Record the learning rate
-
+    lr = lr_scheduler.get_last_lr()[0]
+    if step % 10 == 0:
+        print(f"Step {step}: Learning Rate = {lr:.1e}")
+        
 # Plot the learning rate schedule
 plt.figure(figsize=(10, 6))
 plt.plot(steps, learning_rates, label="Learning Rate Schedule", linewidth=2)

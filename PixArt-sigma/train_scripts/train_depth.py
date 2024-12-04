@@ -114,7 +114,7 @@ def linear_decay_lr_schedule(current_step, warmup_steps, start_step, stop_step, 
 
     if warmup_steps > 0 and current_step < warmup_steps:
         # Warmup phase: linearly increase from 0 to base_lr
-        lr = (current_step / warmup_steps)
+        lr = float(current_step) / float(warmup_steps)
     elif current_step < start_step:
         # After warmup but before decay begins: keep at base_lr
         lr = 1.0
@@ -148,8 +148,8 @@ def log_validation(model, loader, vae, device, step):
 
     # Get the next batch
     batch = next(iter(loader))
-    rgb = batch["rgb_norm"].to(device).to(torch.float16)
-    rgb_int = batch["rgb_int"].to(device).to(torch.float16)  # Real RGB images from batch
+    rgb = batch["rgb_norm"].to(device).to(train_dtype)
+    rgb_int = batch["rgb_int"].to(device).to(train_dtype)  # Real RGB images from batch
     with torch.no_grad():
         bs = rgb.shape[0]
         rgb_embedding = dinvov2_model(preprocess_tensor(rgb)).unsqueeze(1)
@@ -371,28 +371,19 @@ def train():
         grad_norm = None
         if step % len(train_dataloader) == 0 or step==1:
             epoch += 1
-            # train_dataloader.sampler.set_epoch(epoch)
             train_loader_iter = iter(train_dataloader)
         
         batch = next(train_loader_iter)  # Sample the next batch
         # logger.info(f'Step: {step}, Batch Images: {", ".join(batch["rgb_relative_path"])}')
-        rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=torch.float16)
-        depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=torch.float16)
-
-        # Run inference
-        with torch.no_grad():
-            bs = rgb.shape[0]
-            rgb_embedding = dinvov2_model(preprocess_tensor(rgb)).unsqueeze(1)
-            
-        y = resampler(rgb_embedding).unsqueeze(1)
-        # y = 2 * (y - y.min()) / (y.max() - y.min()) - 1
+        rgb = batch["rgb_norm"].to(device=accelerator.device, dtype=train_dtype)
+        depth_gt_for_latent = batch['depth_raw_norm'].to(device=accelerator.device, dtype=train_dtype)
+        bs = rgb.shape[0]
             
         if config.valid_mask_loss:
             valid_mask_for_latent = batch['valid_mask_raw']
             invalid_mask = ~valid_mask_for_latent
             valid_mask_down = ~torch.max_pool2d(invalid_mask.float(), 8, 8).bool().repeat((1, 4, 1, 1))
             valid_mask_down = valid_mask_down.to(device=accelerator.device)
-
         else:    
             valid_mask_down = None
 
@@ -400,11 +391,8 @@ def train():
         rgb_input_latent = vae.encode(rgb).latent_dist.sample().mul_(config.scale_factor)
         depth_gt_latent = encode_depth(depth_gt_for_latent, vae)
 
-        del rgb, depth_gt_for_latent, valid_mask_for_latent
         torch.cuda.empty_cache()
 
-        # bs = rgb_input_latent.shape[0]
-        # y = null_caption_embs.unsqueeze(0).repeat(bs, 1, 1, 1).detach().to(accelerator.device)
         timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=accelerator.device).long()
 
         data_time_all += time.time() - data_time_start
@@ -422,6 +410,12 @@ def train():
                 )
         else:
             noise = None
+        
+        # Run inference
+        with torch.no_grad():
+            rgb_embedding = dinvov2_model(preprocess_tensor(rgb)).unsqueeze(1)
+        y = resampler(rgb_embedding).unsqueeze(1)
+        del rgb, depth_gt_for_latent, valid_mask_for_latent
 
         # Training step
         with accelerator.accumulate(model):
@@ -440,15 +434,16 @@ def train():
             )
             loss = loss_term['loss'].mean()
             accelerator.backward(loss)
-            
             if accelerator.sync_gradients:
                 grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
-            optimizer.step()
-            update_ema(ema, model)
-            lr_scheduler.step()
-
+                optimizer.step()
+                update_ema(ema, model)
+                lr_scheduler.step()
+        
         # Logging
+        
         lr = lr_scheduler.get_last_lr()[0]
+        logs = {}
         logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
         log_buffer.update(logs)
 
@@ -525,7 +520,7 @@ def train():
         # Prepare for next iteration
         global_step += 1
         data_time_start = time.time()
-        del rgb_input_latent, depth_gt_latent, timesteps
+        # del rgb_input_latent, depth_gt_latent, timesteps
         flush()
 
 
@@ -613,6 +608,12 @@ if __name__ == '__main__':
         even_batches=even_batches,
         kwargs_handlers=[init_handler]
     )
+    
+    # Need to be fixed for the all other options 
+    if config.mixed_precision == 'no':
+        train_dtype = torch.float32
+    if config.mixed_precision == 'fp16':
+        train_dtype = torch.float16
 
     log_name = 'train_log.log'
     if accelerator.is_main_process:
@@ -637,7 +638,7 @@ if __name__ == '__main__':
     max_length = config.model_max_length
     kv_compress_config = config.kv_compress_config if config.kv_compress else None
     vae = None
-    vae = AutoencoderKL.from_pretrained(config.vae_pretrained, torch_dtype=torch.float16).to(accelerator.device)
+    vae = AutoencoderKL.from_pretrained(config.vae_pretrained, torch_dtype=train_dtype).to(accelerator.device)
     config.scale_factor = vae.config.scaling_factor
 
     logger.info(f"vae scale factor: {config.scale_factor}")

@@ -87,6 +87,7 @@ def load_checkpoint(
     resume_optimizer=True,
     resume_lr_scheduler=True,
     null_embed_path=None,
+    depth=True,
 ):
     assert isinstance(checkpoint, str)
     logger = get_root_logger()
@@ -109,6 +110,15 @@ def load_checkpoint(
     null_embed = torch.load(null_embed_path, map_location="cpu")
     state_dict["y_embedder.y_embedding"] = null_embed["uncond_prompt_embeds"][0]
     rng_state = checkpoint.get("rng_state", None)
+    if depth:
+        if model.x_embedder.proj.weight.shape[1] != state_dict['x_embedder.proj.weight'].shape[1]:
+            if state_dict['x_embedder.proj.weight'].shape[1] * 2 == model.x_embedder.proj.weight.shape[1]:
+                state_dict['x_embedder.proj.weight'] = state_dict['x_embedder.proj.weight'].repeat((1, 2, 1, 1))
+            else:
+                raise ValueError(
+                    f"Shape mismatch: Model weight shape {model.x_embedder.proj.weight.shape[1]} is not compatible with "
+                    f"state_dict weight shape {state_dict['x_embedder.proj.weight'].shape[1]} for repetition."
+                )
 
     missing, unexpect = model.load_state_dict(state_dict, strict=False)
     if model_ema is not None:

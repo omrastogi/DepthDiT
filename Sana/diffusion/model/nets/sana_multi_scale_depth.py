@@ -170,7 +170,7 @@ class SanaMSBlock(nn.Module):
 #                                 Core Sana Model                                #
 #################################################################################
 @MODELS.register_module()
-class SanaMS(Sana):
+class SanaMSDepth(Sana):
     """
     Diffusion model with a Transformer backbone.
     """
@@ -180,6 +180,7 @@ class SanaMS(Sana):
         input_size=32,
         patch_size=2,
         in_channels=4,
+        depth_channels=4,
         hidden_size=1152,
         depth=28,
         num_heads=16,
@@ -209,6 +210,7 @@ class SanaMS(Sana):
             input_size=input_size,
             patch_size=patch_size,
             in_channels=in_channels,
+            # depth_channels=depth_channels,
             hidden_size=hidden_size,
             depth=depth,
             num_heads=num_heads,
@@ -239,7 +241,7 @@ class SanaMS(Sana):
         self.pos_embed_ms = None
 
         kernel_size = patch_embed_kernel or patch_size
-        self.x_embedder = PatchEmbedMS(patch_size, in_channels, hidden_size, kernel_size=kernel_size, bias=True)
+        self.x_embedder = PatchEmbedMS(patch_size, in_channels+depth_channels, hidden_size, kernel_size=kernel_size, bias=True)
         self.y_embedder = CaptionEmbedder(
             in_channels=caption_channels,
             hidden_size=hidden_size,
@@ -270,13 +272,14 @@ class SanaMS(Sana):
 
         self.initialize()
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, **kwargs):
+    def forward(self, x, timestep, y, input_latent, mask=None, data_info=None, **kwargs):
         """
         Forward pass of Sana.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N, 1, 120, C) tensor of class labels
         """
+        x = torch.cat([input_latent, x], dim=1)
         bs = x.shape[0]
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
@@ -340,12 +343,12 @@ class SanaMS(Sana):
         """
         return self.forward(*args, **kwargs)
 
-    def forward_with_dpmsolver(self, x, timestep, y, data_info, **kwargs):
+    def forward_with_dpmsolver(self, x, timestep, y, input_latent, data_info, **kwargs):
         """
         dpm solver donnot need variance prediction
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        model_out = self.forward(x, timestep, y, data_info=data_info, **kwargs)
+        model_out = self.forward(x, timestep, y, input_latent, data_info=data_info, **kwargs)
         return model_out.chunk(2, dim=1)[0] if self.pred_sigma else model_out
 
     def unpatchify(self, x):
@@ -392,27 +395,28 @@ class SanaMS(Sana):
 
 
 @MODELS.register_module()
-def SanaMS_600M_P1_D28(**kwargs):
-    return SanaMS(depth=28, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
+def SanaMSDepth_600M_P1_D28(**kwargs):
+    return SanaMSDepth(depth=28, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
 
 
-@MODELS.register_module()
-def SanaMS_600M_P2_D28(**kwargs):
-    return SanaMS(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+# TODO- Use these for other configurations  
+# @MODELS.register_module()
+# def SanaMS_600M_P2_D28(**kwargs):
+#     return SanaMS(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 
-@MODELS.register_module()
-def SanaMS_600M_P4_D28(**kwargs):
-    return SanaMS(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+# @MODELS.register_module()
+# def SanaMS_600M_P4_D28(**kwargs):
+#     return SanaMS(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
 
-@MODELS.register_module()
-def SanaMS_1600M_P1_D20(**kwargs):
-    # 20 layers, 1648.48M
-    return SanaMS(depth=20, hidden_size=2240, patch_size=1, num_heads=20, **kwargs)
+# @MODELS.register_module()
+# def SanaMS_1600M_P1_D20(**kwargs):
+#     # 20 layers, 1648.48M
+#     return SanaMS(depth=20, hidden_size=2240, patch_size=1, num_heads=20, **kwargs)
 
 
-@MODELS.register_module()
-def SanaMS_1600M_P2_D20(**kwargs):
-    # 28 layers, 1648.48M
-    return SanaMS(depth=20, hidden_size=2240, patch_size=2, num_heads=20, **kwargs)
+# @MODELS.register_module()
+# def SanaMS_1600M_P2_D20(**kwargs):
+#     # 28 layers, 1648.48M
+#     return SanaMS(depth=20, hidden_size=2240, patch_size=2, num_heads=20, **kwargs)

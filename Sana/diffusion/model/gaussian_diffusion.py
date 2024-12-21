@@ -749,7 +749,6 @@ class GaussianDiffusion:
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
     def training_losses(self, model, x_start, timestep, model_kwargs=None, noise=None, skip_noise=False, valid_mask=None):
-        #TODO Add valid mask in the code bellow
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -839,7 +838,12 @@ class GaussianDiffusion:
                 # best
                 target = th.where(t > 249, noise, x_start)
                 output = th.where(t > 249, pred_noise, pred_startx)
-            loss = (target - output) ** 2
+            
+            if valid_mask is None:
+                loss = (target - output) ** 2
+            else:
+                loss = (target[valid_mask] - output[valid_mask]) ** 2
+
             if model_kwargs.get("mask_ratio", False) and model_kwargs["mask_ratio"] > 0:
                 assert "mask" in model_output
                 loss = F.avg_pool2d(loss.mean(dim=1), model.model.module.patch_size).flatten(1)

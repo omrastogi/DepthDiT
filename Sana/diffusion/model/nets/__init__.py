@@ -41,3 +41,9 @@ from .sana_U_shape_multi_scale import (
     SanaUMS_1600M_P2_D20,
     SanaUMSBlock,
 )
+
+from .sana_multi_scale_depth import (
+    SanaMSDepth,
+    SanaMSDepth_600M_P1_D28,
+    SanaMSBlock,
+)

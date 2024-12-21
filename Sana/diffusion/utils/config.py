@@ -175,6 +175,12 @@ class TrainingConfig(BaseConfig):
 
 
 @dataclass
+class MultiResNoiseConfig(BaseConfig):
+    annealing: bool = True  # Default value
+    strength: float = 0.9  # Default value
+    downscale_strategy: str = "original"  # Default value
+    
+@dataclass
 class SanaConfig(BaseConfig):
     data: DataConfig
     model: ModelConfig
@@ -182,6 +188,7 @@ class SanaConfig(BaseConfig):
     text_encoder: TextEncoderConfig
     scheduler: SchedulerConfig
     train: TrainingConfig
+    multi_res_noise: MultiResNoiseConfig
     work_dir: str = "output/"
     resume_from: Optional[str] = None
     load_from: Optional[str] = None
@@ -191,3 +198,4 @@ class SanaConfig(BaseConfig):
     tracker_project_name: str = "t2i-evit-baseline"
     name: str = "baseline"
     loss_report_name: str = "loss"
+    valid_mask_loss: bool = True

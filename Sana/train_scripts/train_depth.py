@@ -80,6 +80,20 @@ def set_fsdp_env():
     os.environ["FSDP_BACKWARD_PREFETCH"] = "BACKWARD_PRE"
     os.environ["FSDP_TRANSFORMER_CLS_TO_WRAP"] = "SanaBlock"
 
+def convert_depth_to_colored(depth):
+        # Normalize depth values between 0 and 1
+        depth_pred = (depth + 1.0) / 2.0
+        depth_pred = depth_pred.squeeze().detach().cpu().numpy()
+        depth_pred = depth_pred.clip(0, 1)
+
+        # Colorize depth maps using a colormap
+        depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+
+        # Convert to uint8 for wandb logging
+        depth_colored = (depth_colored * 255).astype(np.uint8)
+        depth_colored_hwc = chw2hwc(depth_colored)
+        return depth_colored_hwc
+
 
 @torch.inference_mode()
 def log_validation(accelerator, config, model, logger, step, device, vae=None, init_noise=None):
@@ -92,7 +106,7 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
     for idx, batch in enumerate(val_dataloader):
         rgb = batch["rgb_norm"].to(device).to(torch.float16)
         rgb_int = batch["rgb_int"].to(device).to(torch.float16)  # Real RGB images from batch
-        
+        gt_depth = batch["depth_raw_norm"].to(device).to(torch.float16) # GT Depth images from batch
         # Map input image to latent space + normalize latents
         with torch.no_grad():
             input_latent = vae_encode(config.vae.vae_type, vae, rgb, config.vae.sample_posterior, accelerator.device)
@@ -159,28 +173,35 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
         # Decode the depth from latent space
         depth = decode_depth(config.vae.vae_type, vae, latent)
         depth = torch.clip(depth, -1.0, 1.0)  
-        # Normalize depth values between 0 and 1
-        depth_pred = (depth + 1.0) / 2.0
-        depth_pred = depth_pred.squeeze().detach().cpu().numpy()
-        depth_pred = depth_pred.clip(0, 1)
+        # # Normalize depth values between 0 and 1
+        # depth_pred = (depth + 1.0) / 2.0
+        # depth_pred = depth_pred.squeeze().detach().cpu().numpy()
+        # depth_pred = depth_pred.clip(0, 1)
 
-        # Colorize depth maps using a colormap
-        depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+        # # Colorize depth maps using a colormap
+        # depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
 
-        # Convert to uint8 for wandb logging
-        depth_colored = (depth_colored * 255).astype(np.uint8)
-        depth_colored_hwc = chw2hwc(depth_colored)
+        # # Convert to uint8 for wandb logging
+        # depth_colored = (depth_colored * 255).astype(np.uint8)
+        # depth_colored_hwc = chw2hwc(depth_colored)
+        # calulate colored depth
+        depth_colored_hwc = convert_depth_to_colored(depth)
+        gt_depth_colored_hwc = convert_depth_to_colored(gt_depth.unsqueeze(0))
 
         # Log depth image to wandb
         wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Depth Image {idx}"))
+        wandb_images.append(wandb.Image(gt_depth_colored_hwc, caption=f"Gt Depth {idx}"))
+
 
         # Also log real image from rgb_int
         real_image_np = rgb_int.detach().cpu().numpy()
         real_image_hwc = chw2hwc(real_image_np[0])
         wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {idx}"))
         
-        del z, input_latent, latent, depth, depth_pred, depth_colored, real_image_np
+        del z, input_latent, latent, depth
         del real_image_hwc, depth_colored_hwc
+        del null_y, caption_embs, emb_masks
+        flush()
     # Log all images to wandb
     wandb.log({f"validation_images_step": wandb_images, "step": step})
     wandb_images.clear()
@@ -202,27 +223,8 @@ def decode_depth(name, vae, depth_latent):
         # z = ae.decode(depth_latent.detach() / ae.cfg.scaling_factor)
     stacked = vae.decode(z)
     depth_mean = stacked.mean(dim=1, keepdim=True)
+    del stacked, z
     return depth_mean
-
-def _replace_patchembed_proj(model):
-    """Replace the first layer to accept 8 in_channels."""
-    _weight = model.x_embedder.proj.weight.clone()
-    _bias = model.x_embedder.proj.bias.clone()
-    _weight = _weight.repeat((1, 2, 1, 1))
-    _weight *= 0.5
-    _n_proj_in_channels = model.x_embedder.proj.in_channels * 2
-    _n_proj_out_channel = model.x_embedder.proj.out_channels
-    kernel_size = model.x_embedder.proj.kernel_size
-    padding = model.x_embedder.proj.padding
-    stride = model.x_embedder.proj.stride
-    _new_proj = Conv2d(
-        _n_proj_in_channels, _n_proj_out_channel, kernel_size=kernel_size, stride=stride, padding=padding
-    )
-    _new_proj.weight = Parameter(_weight)
-    _new_proj.bias = Parameter(_bias)
-    model.x_embedder.proj = _new_proj
-    print("PatchEmbed projection layer has been replaced.")
-    return model
 
 def stack_depth_images(depth_in):
     if 4 == len(depth_in.shape):
@@ -237,7 +239,7 @@ def encode_depth(name, vae, depth_in, sample_posterior, device):
     stacked = stack_depth_images(depth_in)
     # encode using VAE encoder
     depth_latent = vae_encode(name, vae, stacked, sample_posterior, device)
-    del stacked
+    del stacked, depth_in
     return depth_latent
 
 
@@ -396,6 +398,14 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                     if hasattr(model, "module")
                     else f"s:({model.h}, {model.w}), "
                 )
+                
+                gradient_norms = {}
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm_internal = param.grad.data.norm(2).item()
+                        # Store the gradient norm with a prefix for WandB grouping
+                        gradient_norms[f'gradient_norm/{name}'] = grad_norm_internal
+                logs.update(gradient_norms)
 
                 info += ", ".join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
                 last_tic = time.time()
@@ -656,13 +666,16 @@ def main(cfg: SanaConfig) -> None:
         pyrallis.dump(config, open(osp.join(config.work_dir, "config.yaml"), "w"), sort_keys=False, indent=4)
         if args.report_to == "wandb":
             import wandb
-            # wandb.init(project=args.tracker_project_name, name=args.name, resume="allow", id=args.name)
-            wandb.init(project=args.tracker_project_name)
+            wandb.init(project=args.tracker_project_name, name=args.name, resume="allow", id=args.name)
+            # wandb.init(project=args.tracker_project_name)
+            wandb.run.log_code(".")
+
             
 
     # logger.info(f"Config: \n{config}")
     logger.info(f"World_size: {get_world_size()}, seed: {config.train.seed}")
     logger.info(f"Initializing: {init_train} for training")
+
     image_size = config.model.image_size
     latent_size = int(image_size) // config.vae.vae_downsample_rate
     pred_sigma = getattr(config.scheduler, "pred_sigma", True)
@@ -810,6 +823,9 @@ def main(cfg: SanaConfig) -> None:
     train_dataloader, val_dataloader = create_datasets(merged_config, rank=rank, world_size=2)
     
     train_dataloader_len = len(train_dataloader)
+    logger.info(f"Number of training samples: {len(train_dataloader.dataset)}")
+    logger.info(f"Total number of batches: {train_dataloader_len}")
+
     load_vae_feat = getattr(train_dataloader.dataset, "load_vae_feat", False)
     load_text_feat = getattr(train_dataloader.dataset, "load_text_feat", False)
 

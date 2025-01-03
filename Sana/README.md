@@ -35,7 +35,15 @@ python -m torch.distributed.run \
 sh scripts/eval.sh \
   --base_data_dir=/data/om/data/eval_dataset \
   --dataset_config=configs/dataset/data_nyu_test.yaml \
-  --output_dir=output/batch_eval/epoch_4_step_150000/nyu_test \
-  --model_path=/data/om/Sana/output/debug/checkpoints/epoch_4_step_150000.pth \
+  --output_dir=output/batch_eval/epoch_6_step_232000/nyu_test \
+  --model_path=/data/om/Sana/output/debug/checkpoints/epoch_6_step_232000.pth \
+  --config=configs/sana_config/1024ms/Sana_600M_img1024.yaml \
+```
+```bash
+sh scripts/eval.sh \
+  --base_data_dir=/data/om/data/eval_dataset \
+  --dataset_config=configs/dataset/data_kitti_val.yaml \
+  --output_dir=output/batch_eval/epoch_6_step_232000/kitti_test \
+  --model_path=/data/om/Sana/output/debug/checkpoints/epoch_6_step_232000.pth \
   --config=configs/sana_config/1024ms/Sana_600M_img1024.yaml \
 ```

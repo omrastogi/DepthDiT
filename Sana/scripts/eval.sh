@@ -6,6 +6,7 @@ DATASET_CONFIG="configs/dataset/data_nyu_test.yaml"
 OUTPUT_DIR="output/batch_eval/nyu_test"
 MODEL_PATH="/data/om/Sana/output/debug/checkpoints/epoch_6_step_198000.pth"
 CONFIG="configs/sana_config/1024ms/Sana_600M_img1024.yaml"
+CUDA_VISIBLE_DEVICES="0"  # Default GPU to use
 
 # Allow overriding parameters via command-line arguments
 while [ $# -gt 0 ]; do
@@ -25,6 +26,9 @@ while [ $# -gt 0 ]; do
     --config=*)
       CONFIG="${1#*=}"
       ;;
+    --cuda_devices=*)
+      CUDA_VISIBLE_DEVICES="${1#*=}"
+      ;;
     *)
       echo "Invalid argument: $1"
       exit 1
@@ -32,8 +36,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Export CUDA_VISIBLE_DEVICES
+export CUDA_VISIBLE_DEVICES
+
 # Echo and run depth inference
 echo "Running inference with the following parameters:"
+echo "  CUDA Devices: $CUDA_VISIBLE_DEVICES"
 echo "  Config: $CONFIG"
 echo "  Base Data Directory: $BASE_DATA_DIR"
 echo "  Model Path: $MODEL_PATH"
@@ -49,6 +57,7 @@ python scripts/inference_depth.py \
 
 # Echo and run evaluation
 echo "Running evaluation with the following parameters:"
+echo "  CUDA Devices: $CUDA_VISIBLE_DEVICES"
 echo "  Base Data Directory: $BASE_DATA_DIR"
 echo "  Dataset Config: $DATASET_CONFIG"
 echo "  Alignment: least_square"

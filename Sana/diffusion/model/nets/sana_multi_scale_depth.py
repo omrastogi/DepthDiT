@@ -238,6 +238,7 @@ class SanaMSDepth(Sana):
         self.h = self.w = 0
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+        self.task_emb_block = nn.Sequential(nn.SiLU(), nn.Linear(4, 6 * hidden_size, bias=True)) #TODO - remove this hardcoding
         self.pos_embed_ms = None
 
         kernel_size = patch_embed_kernel or patch_size
@@ -272,7 +273,7 @@ class SanaMSDepth(Sana):
 
         self.initialize()
 
-    def forward(self, x, timestep, y, input_latent, mask=None, data_info=None, **kwargs):
+    def forward(self, x, timestep, y, input_latent, task_emb=None, mask=None, data_info=None, **kwargs):
         """
         Forward pass of Sana.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -307,7 +308,14 @@ class SanaMSDepth(Sana):
 
         t = self.t_embedder(timestep)  # (N, D)
 
-        t0 = self.t_block(t)
+        t0 = self.t_block(t) # t-->[N, 1152] t0--[N, 6912]
+        # TODO Bring the condition here
+        if task_emb is not None:
+        # TODO Pass the condition from linear with out=6912 to get cond0
+        # TODO Add cond0 and t0; t0 = t0 + cond0 
+            cond0 = self.task_emb_block(task_emb)
+            t0 = t0 + cond0  
+            
         y = self.y_embedder(y, self.training, mask=mask)  # (N, D)
         if self.y_norm:
             y = self.attention_y_norm(y)
@@ -397,6 +405,11 @@ class SanaMSDepth(Sana):
 @MODELS.register_module()
 def SanaMSDepth_600M_P1_D28(**kwargs):
     return SanaMSDepth(depth=28, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
+
+@MODELS.register_module()
+def SanaMSDepth_1600M_P1_D20(**kwargs):
+    # 20 layers, 1648.48M
+    return SanaMSDepth(depth=20, hidden_size=2240, patch_size=1, num_heads=20, **kwargs)
 
 
 # TODO- Use these for other configurations  

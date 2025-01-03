@@ -107,6 +107,7 @@ def vae_encode(name, vae, images, sample_posterior, device):
     else:
         print("error load vae")
         exit()
+    del images
     return z
 
 

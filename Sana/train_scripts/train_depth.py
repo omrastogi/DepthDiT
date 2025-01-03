@@ -100,117 +100,127 @@ def log_validation(accelerator, config, model, logger, step, device, vae=None, i
     torch.cuda.empty_cache()
     model = accelerator.unwrap_model(model).eval()
     vis_sampler = config.scheduler.vis_sampler
-    print("Validation started")
     wandb_images = []  # Collect all images to log at once
-    
-    for idx, batch in enumerate(val_dataloader):
-        rgb = batch["rgb_norm"].to(device).to(torch.float16)
-        rgb_int = batch["rgb_int"].to(device).to(torch.float16)  # Real RGB images from batch
-        gt_depth = batch["depth_raw_norm"].to(device).to(torch.float16) # GT Depth images from batch
-        # Map input image to latent space + normalize latents
-        with torch.no_grad():
-            input_latent = vae_encode(config.vae.vae_type, vae, rgb, config.vae.sample_posterior, accelerator.device)
-        latent_size_h, latent_size_w = input_latent.shape[2], input_latent.shape[3]
-        z = torch.randn(1, config.vae.vae_latent_dim, latent_size_h, latent_size_w, device=device)
+    for task in ['depth_pred', 'rgb_pred']:
+        print(f"Validation started for {task}")
+        for idx, batch in enumerate(val_dataloader):
+            rgb = batch["rgb_norm"].to(device).to(torch.float16)
+            rgb_int = batch["rgb_int"].to(device).to(torch.float16)  # Real RGB images from batch
+            gt_depth = batch["depth_raw_norm"].to(device).to(torch.float16) # GT Depth images from batch
+            
+            # Map input image to latent space + normalize latents
+            with torch.no_grad():
+                input_latent = vae_encode(config.vae.vae_type, vae, rgb, config.vae.sample_posterior, accelerator.device)
+            latent_size_h, latent_size_w = input_latent.shape[2], input_latent.shape[3]
+            z = torch.randn(1, config.vae.vae_latent_dim, latent_size_h, latent_size_w, device=device)
+            
+            # task=depth and batch_size=1
+            if task =='depth_pred':
+                task_emb = torch.tensor([1, 0]).float().unsqueeze(0).repeat(1, 1).to(accelerator.device)
+                task_emb = torch.cat([torch.sin(task_emb), torch.cos(task_emb)], dim=-1).repeat(1, 1)
+            elif task == 'rgb_pred':
+                task_emb = torch.tensor([0, 1]).float().unsqueeze(0).repeat(1, 1).to(accelerator.device)
+                task_emb = torch.cat([torch.sin(task_emb), torch.cos(task_emb)], dim=-1).repeat(1, 1)
+            else:
+                raise ValueError(f"Unknown task: {task}")
+            # Embedding preparation
+            emb_masks = null_caption_token.attention_mask
+            caption_embs = null_caption_embs
+            null_y = null_caption_embs.repeat(1, 1, 1)
+            print(f"Finished embedding for image {idx + 1}/{len(val_dataloader)}")
+            # if input_latent is not None:
+            input_latent = torch.cat([input_latent] * 2)
 
-        # Embedding preparation
-        emb_masks = null_caption_token.attention_mask
-        caption_embs = null_caption_embs
-        null_y = null_caption_embs.repeat(1, 1, 1)
-        print(f"Finished embedding for image {idx + 1}/{len(val_dataloader)}")
-        # if input_latent is not None:
-        input_latent = torch.cat([input_latent] * 2)
-
-        model_kwargs = {
-            'data_info': None,
-            'mask': emb_masks,
-            'input_latent': input_latent
-        }
-        
-        if vis_sampler == "dpm-solver":
-            dpm_solver = DPMS(
-                model.forward_with_dpmsolver,
-                condition=caption_embs,
-                uncondition=null_y,
-                cfg_scale=4.5,
-                model_kwargs=model_kwargs,
+            model_kwargs = dict(
+                data_info=None,
+                mask=emb_masks,
+                input_latent=input_latent,
+                task_emb=task_emb
             )
-            denoised = dpm_solver.sample(
-                z,
-                steps=14,
-                order=2,
-                skip_type="time_uniform",
-                method="multistep",
-            )
-        elif vis_sampler == "flow_euler":
-            flow_solver = FlowEuler(
-                model, condition=caption_embs, uncondition=null_y, cfg_scale=4.5, model_kwargs=model_kwargs
-            )
-            denoised = flow_solver.sample(z, steps=28)
-        elif vis_sampler == "flow_dpm-solver":
-            dpm_solver = DPMS(
-                model.forward_with_dpmsolver,
-                condition=caption_embs,
-                uncondition=null_y,
-                cfg_scale=4.5,
-                model_type="flow",
-                model_kwargs=model_kwargs,
-                schedule="FLOW",
-            )
-            denoised = dpm_solver.sample(
-                z,
-                steps=20,
-                order=2,
-                skip_type="time_uniform_flow",
-                method="multistep",
-                flow_shift=config.scheduler.flow_shift,
-            )
-        else:
-            raise ValueError(f"{vis_sampler} not implemented")
+            
+            if vis_sampler == "dpm-solver":
+                dpm_solver = DPMS(
+                    model.forward_with_dpmsolver,
+                    condition=caption_embs,
+                    uncondition=null_y,
+                    cfg_scale=4.5,
+                    model_kwargs=model_kwargs,
+                )
+                denoised = dpm_solver.sample(
+                    z,
+                    steps=14,
+                    order=2,
+                    skip_type="time_uniform",
+                    method="multistep",
+                )
+            elif vis_sampler == "flow_euler":
+                flow_solver = FlowEuler(
+                    model, condition=caption_embs, uncondition=null_y, cfg_scale=4.5, model_kwargs=model_kwargs
+                )
+                denoised = flow_solver.sample(z, steps=28)
+            elif vis_sampler == "flow_dpm-solver":
+                dpm_solver = DPMS(
+                    model.forward_with_dpmsolver,
+                    condition=caption_embs,
+                    uncondition=null_y,
+                    cfg_scale=4.5,
+                    model_type="flow",
+                    model_kwargs=model_kwargs,
+                    schedule="FLOW",
+                )
+                denoised = dpm_solver.sample(
+                    z,
+                    steps=20,
+                    order=2,
+                    skip_type="time_uniform_flow",
+                    method="multistep",
+                    flow_shift=config.scheduler.flow_shift,
+                )
+            else:
+                raise ValueError(f"{vis_sampler} not implemented")
 
-        latent = denoised.to(next(vae.parameters()).dtype)
-        
-        # Decode the depth from latent space
-        depth = decode_depth(config.vae.vae_type, vae, latent)
-        depth = torch.clip(depth, -1.0, 1.0)  
-        # # Normalize depth values between 0 and 1
-        # depth_pred = (depth + 1.0) / 2.0
-        # depth_pred = depth_pred.squeeze().detach().cpu().numpy()
-        # depth_pred = depth_pred.clip(0, 1)
+            latent = denoised.to(next(vae.parameters()).dtype)
+            
+            if task == 'depth_pred':
+                # Decode the depth from latent space
+                depth = decode_depth(config.vae.vae_type, vae, latent)
+                depth = torch.clip(depth, -1.0, 1.0)  
 
-        # # Colorize depth maps using a colormap
-        # depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+                # calulate colored depth
+                depth_colored_hwc = convert_depth_to_colored(depth)
+                gt_depth_colored_hwc = convert_depth_to_colored(gt_depth.unsqueeze(0))
 
-        # # Convert to uint8 for wandb logging
-        # depth_colored = (depth_colored * 255).astype(np.uint8)
-        # depth_colored_hwc = chw2hwc(depth_colored)
-        # calulate colored depth
-        depth_colored_hwc = convert_depth_to_colored(depth)
-        gt_depth_colored_hwc = convert_depth_to_colored(gt_depth.unsqueeze(0))
+                # Log depth image to wandb
+                wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Depth Image {idx}"))
+                # Log Gt depth
+                wandb_images.append(wandb.Image(gt_depth_colored_hwc, caption=f"Gt Depth {idx}"))
+                
+                del depth, depth_colored_hwc
+            else:
+                samples = vae_decode(config.vae.vae_type, vae, latent)
+                samples = (
+                    torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()[0]
+                )
+                image = Image.fromarray(samples)
+                wandb_images.append(wandb.Image(image, caption=f"Reconstructed Image {idx}"))
+                del samples, image
 
-        # Log depth image to wandb
-        wandb_images.append(wandb.Image(depth_colored_hwc, caption=f"Depth Image {idx}"))
-        wandb_images.append(wandb.Image(gt_depth_colored_hwc, caption=f"Gt Depth {idx}"))
-
-
-        # Also log real image from rgb_int
-        real_image_np = rgb_int.detach().cpu().numpy()
-        real_image_hwc = chw2hwc(real_image_np[0])
-        wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {idx}"))
-        
-        del z, input_latent, latent, depth
-        del real_image_hwc, depth_colored_hwc
-        del null_y, caption_embs, emb_masks
-        flush()
-    # Log all images to wandb
-    wandb.log({f"validation_images_step": wandb_images, "step": step})
-    wandb_images.clear()
+            # Also log real image from rgb_int
+            real_image_np = rgb_int.detach().cpu().numpy()
+            real_image_hwc = chw2hwc(real_image_np[0])            
+            wandb_images.append(wandb.Image(real_image_hwc, caption=f"Real Image {idx}"))
+            
+            del z, input_latent, latent
+            del real_image_hwc
+            del null_y, caption_embs, emb_masks
+            flush()
+        # Log all images to wandb
+        wandb.log({f"validation_images_step_{task}": wandb_images, "step": step})
+        wandb_images.clear()
 
     print("Validation completed and images logged to wandb.")
     del vae
     flush()
-
-
 
 def decode_depth(name, vae, depth_latent):
     """Decode depth latent into depth map."""
@@ -242,7 +252,6 @@ def encode_depth(name, vae, depth_in, sample_posterior, device):
     del stacked, depth_in
     return depth_latent
 
-
 def train(config, args, accelerator, model, optimizer, lr_scheduler, train_dataloader, train_diffusion, logger):
     if getattr(config.train, "debug_nan", False):
         DebugUnderflowOverflow(model)
@@ -268,6 +277,7 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
         lm_time_all = 0
         vae_time_all = 0
         model_time_all = 0
+        rgb_loss, depth_loss = float('inf'), float('inf')
         for step, batch in enumerate(train_dataloader):
             # image, json_info, key = batch
             
@@ -279,7 +289,22 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
             data_time_all += time.time() - data_time_start
             vae_time_start = time.time()
             rgb_input_latent = vae_encode(config.vae.vae_type, vae, rgb, config.vae.sample_posterior, accelerator.device)
-            depth_gt_latent = encode_depth(config.vae.vae_type, vae, depth_gt_for_latent, config.vae.sample_posterior, accelerator.device)
+            gt_latent = encode_depth(config.vae.vae_type, vae, depth_gt_for_latent, config.vae.sample_posterior, accelerator.device)
+            # Randomly decide the task
+            task = 'depth_pred' if torch.rand(1).item() < 0.5 else 'rgb_pred'
+            # Set gt_latent and task_emb based on the chosen task
+            if task == 'depth_pred':
+                gt_latent = encode_depth(config.vae.vae_type, vae, depth_gt_for_latent, config.vae.sample_posterior, accelerator.device)
+                task_emb_values = [1, 0]
+            elif task == 'rgb_pred':
+                gt_latent = rgb_input_latent
+                task_emb_values = [0, 1]
+            else:
+                raise ValueError(f"Unknown task: {task}")
+            
+            task_emb = torch.tensor(task_emb_values).float().unsqueeze(0).to(accelerator.device)
+            task_emb = torch.cat([torch.sin(task_emb), torch.cos(task_emb)], dim=-1).repeat(bs, 1)
+
             del rgb, depth_gt_for_latent
 
             if getattr(config, "valid_mask_loss", False):  # Default to False if valid_mask_loss doesn't exist
@@ -299,9 +324,9 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
             vae_time_all += time.time() - vae_time_start
             lm_time_start = time.time()
             
-            bs = depth_gt_latent.shape[0]
+            
             timesteps = torch.randint(
-                0, config.scheduler.train_sampling_steps, (bs,), device=depth_gt_latent.device
+                0, config.scheduler.train_sampling_steps, (bs,), device=gt_latent.device
             ).long()
             if config.scheduler.weighting_scheme in ["logit_normal"]:
                 # adapting from diffusers.training_utils
@@ -312,14 +337,15 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                     logit_std=config.scheduler.logit_std,
                     mode_scale=None,  # not used
                 )
-                timesteps = (u * config.scheduler.train_sampling_steps).long().to(depth_gt_latent.device)
+                timesteps = (u * config.scheduler.train_sampling_steps).long().to(gt_latent.device)
+            
                 
             if getattr(config, "multi_res_noise", None):
                 strength = getattr(config.multi_res_noise, "strength", 1.0)
                 if getattr(config.multi_res_noise, "annealing", False):
                     strength = strength * (timesteps / train_diffusion.num_timesteps)
                 noise = multi_res_noise_like(
-                    depth_gt_latent,
+                    gt_latent,
                     strength=strength,
                     downscale_strategy=getattr(config.multi_res_noise, "downscale_strategy", "original"),
                     device=accelerator.device,
@@ -336,7 +362,7 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                 optimizer.zero_grad()
                 loss_term = train_diffusion.training_losses(
                     model, 
-                    depth_gt_latent, 
+                    gt_latent, 
                     timesteps, 
                     valid_mask=valid_mask_down,
                     noise=noise,
@@ -344,7 +370,8 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                         y=null_caption_embs.repeat(bs, 1, 1, 1), #y = null_caption_embs.repeat(bs, 1, 1, 1)
                         mask=mask.repeat(bs, 1, 1, 1), #y_mask = mask.repeat(bs, 1, 1, 1) 
                         data_info=None, 
-                        input_latent=rgb_input_latent
+                        input_latent=rgb_input_latent,
+                        task_emb=task_emb
                     )
                 )
                 loss = loss_term["loss"].mean()
@@ -355,11 +382,19 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                 lr_scheduler.step()
                 accelerator.wait_for_everyone()
                 model_time_all += time.time() - model_time_start
-
+            del gt_latent, noise, rgb_input_latent, valid_mask_down, task_emb
+            if task == 'depth_pred':
+                depth_loss = loss.detach().item() 
+            elif task == 'rgb_pred':
+                rgb_loss = loss.detach().item() 
+            else:
+                raise ValueError(f"Unknown task: {task}")
             if torch.any(torch.isnan(loss)):
                 loss_nan_timer += 1
             lr = lr_scheduler.get_last_lr()[0]
             logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
+            logs.update(depth_loss=depth_loss)
+            logs.update(rgb_loss=rgb_loss)
             if grad_norm is not None:
                 logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
             log_buffer.update(logs)
@@ -447,10 +482,7 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                             f.write(osp.join(config.work_dir, "config.py") + "\n")
                             f.write(ckpt_saved_path)
 
-                # if (time.time() - training_start_time) / 3600 > config.train.training_hours:
-                #     logger.info(f"Stopping training at epoch {epoch}, step {global_step} due to time limit.")
-                #     return
-            if config.train.visualize and (global_step % config.train.eval_sampling_steps == 0 or (step + 1) == 1):
+            if config.train.visualize and (global_step % config.train.eval_sampling_steps == 0 or global_step in [2, 50, 100, 250, 500]):
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     if validation_noise is not None:
@@ -475,15 +507,6 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                             vae=vae,
                         )
 
-            # avoid dead-lock of multiscale data batch sampler
-            # for internal, refactor dataloader logic to remove the ad-hoc implementation
-            # if (
-            #     config.model.multi_scale
-            #     and (train_dataloader_len - sampler.step_start // config.train.train_batch_size - step) < 30
-            # ):
-            #     global_step = epoch * train_dataloader_len
-            #     logger.info("Early stop current iteration")
-            #     break
 
             data_time_start = time.time()
 
@@ -666,8 +689,8 @@ def main(cfg: SanaConfig) -> None:
         pyrallis.dump(config, open(osp.join(config.work_dir, "config.yaml"), "w"), sort_keys=False, indent=4)
         if args.report_to == "wandb":
             import wandb
-            wandb.init(project=args.tracker_project_name, name=args.name, resume="allow", id=args.name)
-            # wandb.init(project=args.tracker_project_name)
+            # wandb.init(project=args.tracker_project_name, name=args.name, resume="allow", id=args.name)
+            wandb.init(project=args.tracker_project_name)
             wandb.run.log_code(".")
 
             

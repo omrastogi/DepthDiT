@@ -1,0 +1,5 @@
+test/kitchen_0004/rgb_0001.png test/kitchen_0004/depth_0001.png test/kitchen_0004/filled_0001.png
+test/office_0005/rgb_0009.png test/office_0005/depth_0009.png test/office_0005/filled_0009.png
+test/office_0008/rgb_0015.png test/office_0008/depth_0015.png test/office_0008/filled_0015.png
+test/bedroom_0013/rgb_0059.png test/bedroom_0013/depth_0059.png test/bedroom_0013/filled_0059.png
+test/bookstore_0001/rgb_0117.png test/bookstore_0001/depth_0117.png test/bookstore_0001/filled_0117.png

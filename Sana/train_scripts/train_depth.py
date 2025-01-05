@@ -288,24 +288,21 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
             accelerator.wait_for_everyone()
             data_time_all += time.time() - data_time_start
             vae_time_start = time.time()
-            rgb_input_latent = vae_encode(config.vae.vae_type, vae, rgb, config.vae.sample_posterior, accelerator.device)
-            gt_latent = encode_depth(config.vae.vae_type, vae, depth_gt_for_latent, config.vae.sample_posterior, accelerator.device)
-            # Randomly decide the task
-            task = 'depth_pred' if torch.rand(1).item() < 0.5 else 'rgb_pred'
-            # Set gt_latent and task_emb based on the chosen task
-            if task == 'depth_pred':
-                gt_latent = encode_depth(config.vae.vae_type, vae, depth_gt_for_latent, config.vae.sample_posterior, accelerator.device)
-                task_emb_values = [1, 0]
-            elif task == 'rgb_pred':
-                gt_latent = rgb_input_latent
-                task_emb_values = [0, 1]
-            else:
-                raise ValueError(f"Unknown task: {task}")
             
-            task_emb = torch.tensor(task_emb_values).float().unsqueeze(0).to(accelerator.device)
-            task_emb = torch.cat([torch.sin(task_emb), torch.cos(task_emb)], dim=-1).repeat(bs, 1)
-
-            del rgb, depth_gt_for_latent
+            # Encode the rgb and depth images
+            rgb_input_latent = vae_encode(config.vae.vae_type, vae, rgb, config.vae.sample_posterior, accelerator.device)
+            depth_gt_latent = encode_depth(config.vae.vae_type, vae, depth_gt_for_latent, config.vae.sample_posterior, accelerator.device)
+            
+            # Creating the latents to be use during training
+            gt_latent = torch.cat((depth_gt_latent, rgb_input_latent), dim=0)
+            input_latent = torch.concat((rgb_input_latent, rgb_input_latent), dim=0)
+            
+            # Creating Task embedding 
+            task_emb = torch.tensor([[1, 0], [0, 1]]).float().to(accelerator.device)
+            task_emb = torch.cat([torch.sin(task_emb), torch.cos(task_emb)], dim=-1).repeat_interleave(bs, 0)
+            
+            # Deleting the intermediate tensors
+            del rgb, depth_gt_for_latent, rgb_input_latent
 
             if getattr(config, "valid_mask_loss", False):  # Default to False if valid_mask_loss doesn't exist
                 valid_mask_for_latent = batch['valid_mask_raw']
@@ -315,7 +312,7 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                     invalid_mask.float(), 
                     vae.spatial_compression_ratio, 
                     vae.spatial_compression_ratio
-                ).bool().repeat((1, vae.cfg.latent_channels, 1, 1))
+                ).bool().repeat((2*1, vae.cfg.latent_channels, 1, 1))
                 valid_mask_down = valid_mask_down.to(device=accelerator.device)
             else:    
                 valid_mask_down = None
@@ -338,6 +335,7 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                     mode_scale=None,  # not used
                 )
                 timesteps = (u * config.scheduler.train_sampling_steps).long().to(gt_latent.device)
+            timesteps = timesteps.repeat(2)
             
                 
             if getattr(config, "multi_res_noise", None):
@@ -367,10 +365,10 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                     valid_mask=valid_mask_down,
                     noise=noise,
                     model_kwargs=dict(
-                        y=null_caption_embs.repeat(bs, 1, 1, 1), #y = null_caption_embs.repeat(bs, 1, 1, 1)
-                        mask=mask.repeat(bs, 1, 1, 1), #y_mask = mask.repeat(bs, 1, 1, 1) 
+                        y=null_caption_embs.repeat(2*bs, 1, 1, 1), #y = null_caption_embs.repeat(bs, 1, 1, 1)
+                        mask=mask.repeat(2*bs, 1, 1, 1), #y_mask = mask.repeat(bs, 1, 1, 1) 
                         data_info=None, 
-                        input_latent=rgb_input_latent,
+                        input_latent=input_latent,
                         task_emb=task_emb
                     )
                 )
@@ -382,13 +380,7 @@ def train(config, args, accelerator, model, optimizer, lr_scheduler, train_datal
                 lr_scheduler.step()
                 accelerator.wait_for_everyone()
                 model_time_all += time.time() - model_time_start
-            del gt_latent, noise, rgb_input_latent, valid_mask_down, task_emb
-            if task == 'depth_pred':
-                depth_loss = loss.detach().item() 
-            elif task == 'rgb_pred':
-                rgb_loss = loss.detach().item() 
-            else:
-                raise ValueError(f"Unknown task: {task}")
+            del gt_latent, noise, input_latent, valid_mask_down, task_emb
             if torch.any(torch.isnan(loss)):
                 loss_nan_timer += 1
             lr = lr_scheduler.get_last_lr()[0]

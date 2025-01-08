@@ -70,9 +70,11 @@ from diffusion.utils.lr_scheduler import build_lr_scheduler
 from diffusion.utils.misc import DebugUnderflowOverflow, init_random_seed, read_config, set_random_seed
 from diffusion.utils.optimizer import auto_scale_lr, build_optimizer
 from diffusion.data.datasets.utils import ASPECT_RATIO_256, ASPECT_RATIO_512, ASPECT_RATIO_1024, ASPECT_RATIO_2048, ASPECT_RATIO_2880, ASPECT_RATIO_4096
+from dotenv import load_dotenv
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+load_dotenv() # Load .env file
+os.environ["WANDB_API_KEY"] = os.getenv("WANDB_API_KEY")
 
 def set_fsdp_env():
     os.environ["ACCELERATE_USE_FSDP"] = "true"
@@ -666,8 +668,11 @@ def main(cfg: SanaConfig) -> None:
         pyrallis.dump(config, open(osp.join(config.work_dir, "config.yaml"), "w"), sort_keys=False, indent=4)
         if args.report_to == "wandb":
             import wandb
-            wandb.init(project=args.tracker_project_name, name=args.name, resume="allow", id=args.name)
-            # wandb.init(project=args.tracker_project_name)
+            wandb.init(
+                project=args.tracker_project_name,  # Sets the W&B project name
+                resume="allow",                     # Allows resuming a run if the same ID exists
+                # settings=wandb.Settings(init_timeout=60)  # Extends timeout to 300 seconds
+            )
             wandb.run.log_code(".")
 
             
@@ -812,13 +817,14 @@ def main(cfg: SanaConfig) -> None:
 
     # Load the dataset configuration using OmegaConf
     dataset_config = OmegaConf.load("configs/depth_dataset.yaml")
-
     # Convert structured_config to an unstructured DictConfig
     unstructured_config = OmegaConf.to_container(structured_config, resolve=True)
     unstructured_config = OmegaConf.create(unstructured_config)
 
     # Merge the dataset config into the unstructured config
     merged_config = OmegaConf.merge(unstructured_config, dataset_config)
+    if config.base_data_dir:
+        merged_config.paths.base_data_dir = config.base_data_dir
 
     train_dataloader, val_dataloader = create_datasets(merged_config, rank=rank, world_size=2)
     

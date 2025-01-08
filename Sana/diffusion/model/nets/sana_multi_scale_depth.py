@@ -398,6 +398,10 @@ class SanaMSDepth(Sana):
 def SanaMSDepth_600M_P1_D28(**kwargs):
     return SanaMSDepth(depth=28, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
 
+@MODELS.register_module()
+def SanaMSDepth_1600M_P1_D20(**kwargs):
+    # 20 layers, 1648.48M
+    return SanaMSDepth(depth=20, hidden_size=2240, patch_size=1, num_heads=20, **kwargs)
 
 # TODO- Use these for other configurations  
 # @MODELS.register_module()

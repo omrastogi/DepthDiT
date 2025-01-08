@@ -199,3 +199,5 @@ class SanaConfig(BaseConfig):
     name: str = "baseline"
     loss_report_name: str = "loss"
     valid_mask_loss: bool = True
+    base_data_dir: Optional[str] = None
+    

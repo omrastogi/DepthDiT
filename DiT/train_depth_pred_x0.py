@@ -418,7 +418,7 @@ class DepthTrainer:
         else:
             self.optimizer_dict = None
 
-        self.diffusion = create_diffusion(timestep_respacing="")
+        self.diffusion = create_diffusion(timestep_respacing="", predict_xstart=True)
         self.vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{self.args.vae}").to(self.device)
 
         self.logger.info(f"DiT Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
@@ -512,7 +512,7 @@ class DepthTrainer:
             scheduler=self.config.validation.scheduler,
             model=self.model.module,
             vae=self.vae,
-            diffusion=create_diffusion(str(self.config.validation.diffusion_steps))
+            diffusion=create_diffusion(str(self.config.validation.diffusion_steps), predict_xstart=True)
         )
         depth_colored, images = [], []
         for batch in self.val_loader:
@@ -622,7 +622,7 @@ class DepthTrainer:
                 )
 
             # Validation
-            if (train_step % self.args.validation_every == 0 or train_step in [50, 100, 250, 500, 750, 1000]) and self.rank == 0:
+            if (train_step % self.args.validation_every == 0 or train_step in [1, 50, 100, 250, 500, 750, 1000]) and self.rank == 0:
                 self.validation()
 
             # Save checkpoints:
@@ -752,7 +752,7 @@ if __name__ == "__main__":
     parser.add_argument("--validation-every", type=int, default=200)
     parser.add_argument("--valid-mask-loss", action="store_true", help="Use valid mask loss")
     parser.add_argument("--pretrained-path", type=str, default="checkpoints/DiT-XL-2-512x512.pt", help="Path to the pretrained model checkpoint")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the optimizer")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate for the optimizer")
     parser.add_argument("--weight-decay", type=float, default=0, help="Weight decay for the optimizer")
     parser.add_argument("--training-label", type=str, default="training", help="Label for the training session")
     parser.add_argument("--config-path", type=str, default="config/training_config.yaml", help="Path of configuration script")

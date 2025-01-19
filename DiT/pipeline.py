@@ -337,7 +337,7 @@ class DepthPipeline:
         rgb_norm = torch.from_numpy(rgb_norm).float().unsqueeze(0)
         return rgb_norm
 
-    def single_infer(self, rgb_batch):
+    def single_infer(self, rgb_batch, task_emb=None):
         """Run inference to generate depth maps for a batch of images."""
         device = self.device
 
@@ -352,7 +352,7 @@ class DepthPipeline:
         y_null = torch.tensor([1000] * batch_size, device=device)
         y = torch.cat([y, y_null], 0)
         rgb_input_latent = torch.cat([rgb_input_latent, rgb_input_latent], 0)
-        model_kwargs = dict(y=y, cfg_scale=self.cfg_scale, input_img=rgb_input_latent)
+        model_kwargs = dict(y=y, cfg_scale=self.cfg_scale, input_img=rgb_input_latent, task_emb=task_emb)
 
         if self.scheduler == "ddim":
             samples = self.diffusion.ddim_sample_loop(
@@ -424,6 +424,58 @@ class DepthPipeline:
         depth_colored_img = Image.fromarray(depth_colored_hwc)
         
         return depth_pred, depth_colored_img, pred_uncert
+    
+    def pipe_task_cond(self, input_image: Image.Image, task_emb):
+        """Process a single image through the inference pipeline."""
+        rgb_norm = self.get_rgb_norm(input_image).to(self.device)
+        input_size = input_image.size
+
+        duplicated_rgb = rgb_norm.expand(self.ensemble_size, -1, -1, -1)
+        single_rgb_dataset = TensorDataset(duplicated_rgb)
+        single_rgb_loader = DataLoader(
+            single_rgb_dataset, batch_size=self.batch_size, shuffle=False
+        )
+        
+        import time
+
+        depth_pred_ls = []
+        start_time = time.time()
+        for batch in single_rgb_loader:
+            (batched_img,) = batch
+            if self.fp16:
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast():
+                        depth_pred_raw = self.single_infer(rgb_batch=batched_img, task_emb=task_emb)
+            else:
+                depth_pred_raw = self.single_infer(rgb_batch=batched_img, task_emb=task_emb)
+            depth_pred_ls.append(depth_pred_raw.detach())
+        depth_preds = torch.concat(depth_pred_ls, dim=0)
+        torch.cuda.empty_cache()
+        end_time = time.time()
+        print(f"Inference time: {end_time - start_time:.2f} seconds")
+
+        if self.ensemble_size > 1:
+            depth_pred, pred_uncert = ensemble_depth(depth_preds, max_res=50)
+        else:
+            depth_pred = depth_preds
+            pred_uncert = None
+
+        depth_pred = resize(depth_pred, input_size[::-1], antialias=True)
+
+        depth_pred = depth_pred.squeeze().cpu().numpy()
+
+        if pred_uncert is not None:
+            pred_uncert = pred_uncert.squeeze().cpu().numpy()
+
+        depth_pred = depth_pred.clip(0, 1)
+        
+        depth_colored = colorize_depth_maps(depth_pred, 0, 1, cmap="Spectral").squeeze()
+        depth_colored = (depth_colored * 255).astype(np.uint8)
+        depth_colored_hwc = chw2hwc(depth_colored)
+        depth_colored_img = Image.fromarray(depth_colored_hwc)
+        
+        return depth_pred, depth_colored_img, pred_uncert
+
 
     def initialize_model(self):
         """Initialize the model, diffusion, and VAE."""

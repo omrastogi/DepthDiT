@@ -158,6 +158,7 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        task_cond=False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -169,6 +170,9 @@ class DiT(nn.Module):
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        if task_cond:
+            self.task_emb_block = nn.Sequential(nn.SiLU(), nn.Linear(4, hidden_size, bias=True)) #TODO - remove this hardcoding
+
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -177,6 +181,7 @@ class DiT(nn.Module):
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -230,7 +235,7 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y, input_img=None):
+    def forward(self, x, t, y, input_img=None, task_emb=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -242,6 +247,9 @@ class DiT(nn.Module):
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
+        if task_emb is not None:
+            cond0 = self.task_emb_block(task_emb)
+            t = cond0 + t
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
@@ -249,7 +257,7 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale, input_img=None):
+    def forward_with_cfg(self, x, t, y, cfg_scale, input_img=None, task_emb=None):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
@@ -258,7 +266,7 @@ class DiT(nn.Module):
         combined = torch.cat([half, half], dim=0)
         # assuming an input image in the function for depth conditioning
         # combined = torch.cat([combined, combined], dim=1)
-        model_out = self.forward(combined, t, y, input_img)
+        model_out = self.forward(combined, t, y, input_img, task_emb)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.

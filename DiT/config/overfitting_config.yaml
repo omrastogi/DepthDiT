@@ -54,7 +54,7 @@ validation:
   batch_size: 3
 
 lr_scheduler:
-  warmup: 500
-  start_step: 1000
-  stop_step: 3000 
+  warmup: 1000
+  start_step: 5000
+  stop_step: 10000 
   stable_lr: 1e-6

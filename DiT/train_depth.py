@@ -313,7 +313,7 @@ class DepthTrainer:
             wandb.init(
                 project="DiT-Onestep-Training",  # Replace with your WandB project name
                 name=f"{args.model}-{args.image_size}-{args.training_label}-{datetime.now().strftime('%m%d-%H:%M:%S')}",
-                config=vars(args),
+                config=vars(args)
             )
 
         self.batch_size = int(args.global_batch_size // self.world_size)
@@ -391,11 +391,11 @@ class DepthTrainer:
             # The state_dict is already modified for depth, so modify the model first
             self._replace_patchembed_proj()
             # Load the state_dict into the model
-            self.model.load_state_dict(state_dict_model)
+            self.model.load_state_dict(state_dict_model, strict=False)
         else:
             # For a vanilla DiT model:
             # Load the state_dict first, and then modify the model afterwards
-            self.model.load_state_dict(state_dict_model)
+            self.model.load_state_dict(state_dict_model, strict=False)
             self._replace_patchembed_proj()
 
         # Create EMA model and set it as non-trainable
@@ -535,7 +535,7 @@ class DepthTrainer:
 
         # Log to wandb
         if self.rank == 0:
-            wandb.log({f"validation_images_step_{self.train_step}": wandb_images, "step": self.train_step})
+            wandb.log({f"validation_images_step_{self.train_step}": wandb_images})
 
         print("Validation completed and images logged to wandb.")
         gc.collect()
@@ -562,7 +562,6 @@ class DepthTrainer:
                 train_loader_iter = iter(self.train_loader)
 
             batch = next(train_loader_iter)
-
             rgb = batch["rgb_norm"].to(self.device)
             depth_gt_for_latent = batch['depth_raw_norm'].to(self.device)
             if self.args.valid_mask_loss:
@@ -615,14 +614,14 @@ class DepthTrainer:
                     {
                     "smooth_loss": avg_loss, 
                     "train_loss": loss.item(), 
-                    "step": train_step, 
                     "epoch": epoch, 
                     "lr":current_lr
-                    }
+                    },
+                    step=train_step
                 )
 
             # Validation
-            if (train_step % self.args.validation_every == 0 or train_step in [50, 100, 250, 500, 750, 1000]) and self.rank == 0:
+            if (train_step % self.args.validation_every == 0 or train_step in [1, 10, 50, 100, 250, 500, 750, 1000]) and self.rank == 0:
                 self.validation()
 
             # Save checkpoints:
@@ -792,7 +791,7 @@ torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 
 # OVERFITTING
 '''
-torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
+torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
 --validation-every 500 \
@@ -802,6 +801,20 @@ torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
 --config-path config/overfitting_config.yaml \
 --results-dir checkpoints
 '''
+
+# Full Trainig
+'''
+CUDA_VISIBLE_DEVICES=1 torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
+--model DiT-XL/2 \
+--valid-mask-loss \
+--validation-every 500 \
+--iteration 15000 \
+--global-batch-size 10 \
+--ckpt-every 2000 \
+--config-path config/overfitting_config.yaml \
+--results-dir checkpoints
+'''
+
 
 # TESTING
 """

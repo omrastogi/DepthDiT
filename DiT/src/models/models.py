@@ -165,6 +165,13 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.input_conv = nn.Conv2d(
+                            in_channels=4,     # Number of input channels
+                            out_channels=4,   # Number of output channels (filters)
+                            kernel_size=3,     # Kernel size (3x3)
+                            stride=1,          # Stride (default=1)
+                            padding=1          # Padding (kernel_size // 2 for "same" padding)
+                        )
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -180,6 +187,9 @@ class DiT(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self):
+        # input conv to be init by zero init
+        torch.nn.init.constant_(self.input_conv.weight, 0)
+
         # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -238,6 +248,7 @@ class DiT(nn.Module):
         y: (N,) tensor of class labels
         """
         if input_img is not None:
+            input_img = self.input_conv(input_img) + input_img
             x = torch.cat([input_img, x], dim=1)
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)

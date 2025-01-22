@@ -1,6 +1,6 @@
 ## Training and Inference for Depth Estimation
 
-We provide scripts for training and inference of depth estimation using DiT models.
+We provide scripts for training and inference of depth estimation using DiT models. Added a layer of Convolution layer, with skip connection. 
 
 ### Inference
 
@@ -20,7 +20,7 @@ python inference_depth.py \
 To train a new DiT model for depth estimation, use the `train_depth.py` script. This script supports distributed training and various configurations. For example, to train a DiT-XL/2 model on 2 GPU, run:
 
 ```bash
-torchrun --nnodes=1 --nproc_per_node=2  train_depth.py \
+torchrun --nnodes=1 --nproc_per_node=1  train_depth.py \
 --model DiT-XL/2 \
 --valid-mask-loss \
 --epochs 6 \

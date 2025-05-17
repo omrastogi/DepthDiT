@@ -1,5 +1,5 @@
 # DepthDiT
-
+This work was done, while at VAL under the supervision of Ankit Dhiman.
 <div align="center">
   <img src="assets/depth_dit_comp.png" alt="Depth Estimation Comparison" style="max-width: 100%; height: auto;">
 </div>
@@ -100,6 +100,15 @@ python eval.py \
 2. Training on better pretrained model also did give results 
 
 # Extras
-1. Check READMEs in respective subdirectories for Pixart and DiT. For PixArt, see [experiments/PixArt-sigma/README.md](experiments/PixArt-sigma/README.md)
+1. Check the READMEs in the respective subdirectories:
+   - [PixArt README](experiments/PixArt-sigma/README.md)
+   - [Sana README](experiments/Sana/README.md)
 2. DiT checkpoint - https://huggingface.co/omrastogi/depth_dit/tree/main
 3. Hypersim-Processed - https://huggingface.co/datasets/omrastogi/Hypersim-Processed
+
+# Related Work 
+1. [Marigold](https://marigoldmonodepth.github.io/): a finetuned diffusion model for estimating monocular depth.
+2. [Lotus](https://lotus3d.github.io/): one-step diffusion model with x0 prediction for depth estimation 
+3. [OneDiffusion](https://lehduong.github.io/OneDiffusion-homepage/): Modified NextDiT with video frame mechanism for diverse tasks, including depth 
+4. [Diception](https://aim-uofa.github.io/Diception/): End to end training MM-DiT for general perception task
+

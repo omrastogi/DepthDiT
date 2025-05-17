@@ -1,0 +1,6 @@
+autoroot
+autorootcwd
+timm
+diffusers
+accelerate
+# For CUDA support, install the appropriate torch version with CUDA (see PyTorch docs)

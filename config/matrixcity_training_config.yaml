@@ -1,0 +1,42 @@
+dataset:
+  train:
+      name: matrixcity
+      disp_name: matrixcity_train
+      dir: MatrixCity
+      filenames: data_split/matrixcity/final_data_street_train_20k.txt 
+      resize_to_hw: [512, 512]
+
+  val:
+      name: matrixcity
+      disp_name: matrixcity_vis_small
+      dir: MatrixCity
+      filenames: data_split/matrixcity/final_data_street_vis_3.txt
+      resize_to_hw: [512, 512]
+
+depth_normalization:
+  type: scale_shift_depth
+  clip: true
+  norm_min: -1.0
+  norm_max: 1.0
+  min_max_quantile: 0.02
+
+augmentation:
+  lr_flip_p: 0.5
+
+multi_res_noise:
+  annealing: true
+  strength: 0.9
+  downscale_strategy: 'original'
+
+paths:
+  base_data_dir: '/mnt/c1e1833e-4df6-4c4c-88aa-8cd3d7d3932b/om/MatrixCity'
+
+dataloader:
+  num_workers: 1
+  seed: 2024  # to ensure continuity when resuming from checkpoint
+
+validation:
+  cfg_scale: 4.0
+  diffusion_steps: 20
+  scheduler: 'ddim'
+  batch_size: 3

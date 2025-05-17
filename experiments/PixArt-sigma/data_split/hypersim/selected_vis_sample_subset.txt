@@ -1,0 +1,3 @@
+ai_001_001/rgb_cam_00_fr0035.png ai_001_001/depth_plane_cam_00_fr0035.png  (train)
+ai_001_001/rgb_cam_00_fr0037.png ai_001_001/depth_plane_cam_00_fr0037.png  (train)
+ai_001_001/rgb_cam_00_fr0038.png ai_001_001/depth_plane_cam_00_fr0038.png  (train)

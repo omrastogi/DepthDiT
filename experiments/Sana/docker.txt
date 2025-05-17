@@ -1,0 +1,32 @@
+#!/bin/sh
+#SBATCH --job-name=om_sana          # Job name
+#SBATCH --ntasks=1                  # Number of tasks (usually 1 for Docker)
+#SBATCH --cpus-per-task=4           # Number of CPU cores per task
+#SBATCH --time=60:00:00             # Time limit hrs:min:sec
+#SBATCH --output=serial_sana.out    # Standard output
+#SBATCH --error=serial_sana.err     # Error log
+#SBATCH --gres=gpu:1                # Number of GPUs
+#SBATCH --partition=q_2day-1G       # Queue type (adjust as per availability)
+#SBATCH --mem=16GB                  # Memory allocation
+
+echo "Starting the job in Docker via Slurm"
+
+docker run -it --ipc=host --shm-size=16G --rm \
+    -v /raid/cdsdhim/om/depth-estimation-dit/Sana:/workspace \
+    -v /raid/cdsdhim/om/depth_datasets:/data:ro \
+    cdsdhim-reflection:latest bash -c "
+    export PATH=/root/miniconda/bin:\$PATH && \
+    source /root/miniconda/etc/profile.d/conda.sh && \
+    cd /workspace && \
+    conda activate sana && \
+    python -m torch.distributed.launch --nproc_per_node=2 --use_env train_scripts/train_depth.py \
+    --config_path=configs/sana_config/1024ms/Sana_1600M_img1024_AdamW.yaml \
+    --work_dir=output/full_train_1600_1024 \
+    --name=tmp \
+    --resume_from=latest \
+    --report_to=tensorboard \
+    --debug=true \
+    --model.load_from=hf://Efficient-Large-Model/Sana_1600M_1024px/checkpoints/Sana_1600M_1024px.pth \
+    --model.multi_scale=true \
+    --train.train_batch_size=32
+"

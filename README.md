@@ -100,6 +100,6 @@ python eval.py \
 2. Training on better pretrained model also did give results 
 
 # Extras
-1. Check READMEs in respective subdirectories for Pixart and DiT 
+1. Check READMEs in respective subdirectories for Pixart and DiT. For PixArt, see [experiments/PixArt-sigma/README.md](experiments/PixArt-sigma/README.md)
 2. DiT checkpoint - https://huggingface.co/omrastogi/depth_dit/tree/main
 3. Hypersim-Processed - https://huggingface.co/datasets/omrastogi/Hypersim-Processed

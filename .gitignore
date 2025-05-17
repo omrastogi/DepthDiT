@@ -1,6 +1,7 @@
 /checkpoints
 /data
 /results
+/output
 /wandb
 /.vscode
 __pycache__/

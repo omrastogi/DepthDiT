@@ -5,32 +5,3 @@
 /wandb
 /.vscode
 __pycache__/
-output_cv/
-output_all/
-output_demo/
-output_debug/
-output/
-
-# added by ylw
-*.pt
-*.pth
-*mj*
-s3helper/
-TODO.md
-pretrained_models
-work_dir
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-PixArt-sigma/pixart-sigma-toy-dataset
-depth_datasets/
-model_checkpoints/
-embeddings/
-process_data/checkpoints/

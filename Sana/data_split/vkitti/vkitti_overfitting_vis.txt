@@ -1,3 +1,0 @@
-rgb/Scene02/clone/frames/rgb/Camera_0/rgb_00022.jpg depth/Scene02/clone/frames/depth/Camera_0/depth_00022.png
-rgb/Scene02/clone/frames/rgb/Camera_0/rgb_00024.jpg depth/Scene02/clone/frames/depth/Camera_0/depth_00024.png
-rgb/Scene02/clone/frames/rgb/Camera_0/rgb_00025.jpg depth/Scene02/clone/frames/depth/Camera_0/depth_00025.png

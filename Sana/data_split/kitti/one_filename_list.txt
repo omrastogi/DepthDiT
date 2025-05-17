@@ -1,1 +1,0 @@
-2011_09_26/2011_09_26_drive_0002_sync/image_02/data/0000000069.png 2011_09_26_drive_0002_sync/proj_depth/groundtruth/image_02/0000000069.png 721.5377

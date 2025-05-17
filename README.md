@@ -4,7 +4,7 @@
   <img src="assets/depth_dit_comp.png" alt="Depth Estimation Comparison" style="max-width: 100%; height: auto;">
 </div>
 
-### Implements depth estimation using Diffusion Transformer (DiT) models.
+### Implements depth estimation using Diffusion Transformer.
 
 ### Supports:
 - Training, inference, and evaluation scripts.
@@ -15,7 +15,7 @@
 ### Datasets used: 
 - Hypersim 
 - Vkitti 
-- Matrixcity
+- [Matrixcity](Matrixcity/README.md)
 
 ## Getting Started 
 

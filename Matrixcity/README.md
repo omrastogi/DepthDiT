@@ -1,5 +1,14 @@
 # MatrixCity For Depth 
+<div align="center">
+  <img src="assets/image.png" alt="MatrixCity Example" style="max-width: 100%; height: auto;">
+</div>
 
+## Pipeline Explained 
+<div align="center">
+  <img src="assets/flow_chart.png" alt="MatrixCity Pipeline Flowchart" style="max-width: 100%; height: auto;">
+</div>
+
+## Follow the following
 ```
 pip install tarfile open_clip gradio
 ```
